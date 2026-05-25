@@ -1,0 +1,1470 @@
+---
+title: "HUMAnN3 Functional Potential Analysis"
+output: html_document
+date: "2026-05-01"
+---
+
+# NEON Epilithon Shotgun Metagenomics - Functional Potential
+# Sites: LEWI, MART, POSE, WALK | Years: 2022-2023
+# Comparisons: Site x Year (no seasonal data in shotgun dataset)
+
+# HUMAnN3 v3.9 
+# Nucleotide DB: ChocoPhlAn full
+# Protein DB: UniRef90 EC-filtered (Diamond translated search)
+# Pathway DB: MetaCyc (built into HUMAnN3)
+# Comparisons: Site x Year (no seasonal data in shotgun dataset)
+
+## 1. Load Libraries
+```{r}
+library(tidyverse)
+library(vegan)
+library(ggplot2)
+library(RColorBrewer)
+library(patchwork)
+library(MMUPHin)
+library(Maaslin2)
+library(ggraph)
+library(tidygraph)
+```
+
+## 2. Set File Paths
+```{r}
+PATHABUNDANCE_FILE <- "~/Documents/NEON/humann3_merged/merged_pathabundance_cpm.tsv"
+PATHCOVERAGE_FILE  <- "~/Documents/NEON/humann3_merged/merged_pathcoverage.tsv"
+GENEFAMILIES_FILE  <- "~/Documents/NEON/humann3_merged/merged_genefamilies_cpm.tsv"
+METADATA_FILE      <- "~/Documents/NEON/March_final/metadata/shotgun/meta_with_seasons.csv"
+OUTPUT_DIR         <- "~/Documents/NEON/March_final/humann3"
+```
+
+## 3. Load Metadata
+```{r}
+meta <- read_csv(METADATA_FILE) %>%
+  mutate(
+    site  = factor(site, levels = c("LEWI", "POSE", "WALK", "MART")),
+    year  = factor(year)
+  )
+```
+
+## 4. Load HUMAnN3 Pathway Abundance
+```{r}
+humann_path <- read_tsv(PATHABUNDANCE_FILE)
+dim(humann_path)
+head(humann_path[, 1:5])
+```
+
+
+## 5. Clean and filter pathway abundance table
+```{r}
+# Strip _cat_Abundance suffix from column names
+colnames(humann_path) <- gsub("_cat_Abundance", "", colnames(humann_path))
+
+# Rename first column to Pathway
+colnames(humann_path)[1] <- "Pathway"
+
+# Keep only unstratified rows (no | in pathway name)
+# and remove UNMAPPED and UNINTEGRATED
+humann_path_unstrat <- humann_path %>%
+  filter(!str_detect(Pathway, "\\|"),
+         !Pathway %in% c("UNMAPPED", "UNINTEGRATED"))
+
+dim(humann_path_unstrat)
+head(humann_path_unstrat[, 1:5])
+```
+
+
+
+## 6. Prepare matrix for analysis
+```{r}
+# Convert to matrix (samples as rows, pathways as columns)
+path_mat <- humann_path_unstrat %>%
+  column_to_rownames("Pathway") %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("sample_id")
+
+# Join with metadata
+path_meta <- path_mat %>%
+  left_join(meta %>% select(sample_id, site, year), by = "sample_id")
+
+# Check all samples matched
+nrow(path_meta)  # should be 40
+sum(is.na(path_meta$site))  # should be 0
+```
+
+## 6b. MMUPHin batch correction for instrument effect
+```{r}
+# Prepare matrix for MMUPHin (features as rows, samples as columns)
+path_for_correction <- humann_path_unstrat %>%
+  column_to_rownames("Pathway") %>%
+  as.matrix()
+
+# Convert CPM to proportions
+path_proportions <- sweep(path_for_correction, 2, colSums(path_for_correction), "/")
+
+# Prepare metadata aligned to matrix columns
+meta_df <- meta %>% column_to_rownames("sample_id") %>% as.data.frame()
+path_proportions <- path_proportions[, rownames(meta_df)]
+
+# Run MMUPHin - same approach as Kraken2 script
+fit_adjust <- adjust_batch(
+  feature_abd = path_proportions,
+  batch       = "instrument_model",
+  covariates  = "site",
+  data        = meta_df,
+  control     = list(verbose = FALSE)
+)
+
+path_corrected <- fit_adjust$feature_abd_adj
+dim(path_corrected)
+```
+
+## 7. PERMANOVA on batch-corrected pathway abundance (full marginal model)
+
+### Hypothesis
+
+H0: Site does not explain functional community composition after accounting for year
+
+H0: Year does not explain functional community composition after accounting for site
+
+HA: At least one term explains significant variation after accounting for the other
+
+```{r}
+# Transpose for vegan (samples as rows)
+path_corrected_t <- t(path_corrected) %>% as.data.frame()
+
+# Align metadata
+meta_aligned <- meta_df[rownames(path_corrected_t), ]
+
+# Bray-Curtis dissimilarity on corrected data
+bc_dist_corrected <- vegdist(path_corrected_t, method = "bray")
+
+# Full marginal PERMANOVA (each term tested after accounting for the other)
+set.seed(123)
+perm_full_marg <- adonis2(bc_dist_corrected ~ site + year,
+                          data = meta_aligned,
+                          permutations = 999,
+                          by = "margin")
+perm_full_marg
+```
+
+Interpretation:
+- Site: R²=0.427, F=8.828, p=0.001 *** - site remains dominant even after controlling for year
+- Year: R²=0.008, F=0.478, p=0.928 - year remains non-significant after controlling for site
+
+For writing:
+In the full marginal model, site remained a significant and dominant driver of epilithon 
+functional community composition after controlling for year (PERMANOVA: R²=0.427, F=8.828, 
+p=0.001). Year was not significant after controlling for site (R²=0.008, p=0.928), 
+confirming that functional potential is structured primarily by location rather than 
+interannual variation.
+
+
+## 8. PCoA plot - batch-corrected functional potential
+```{r}
+site_colors <- c("LEWI" = "#E41A1C", "MART" = "#377EB8",
+                 "POSE" = "#4DAF4A", "WALK" = "#984EA3")
+
+# PCoA on corrected Bray-Curtis distance
+pcoa_result <- cmdscale(bc_dist_corrected, eig = TRUE, k = 3)
+
+# Variance explained
+var_explained <- round(pcoa_result$eig / sum(pcoa_result$eig[pcoa_result$eig > 0]) * 100, 1)
+
+# Build plot dataframe
+pcoa_df <- data.frame(
+  PC1       = pcoa_result$points[, 1],
+  PC2       = pcoa_result$points[, 2],
+  PC3       = pcoa_result$points[, 3],
+  sample_id = rownames(pcoa_result$points)
+) %>%
+  left_join(meta, by = "sample_id")
+
+# PC1 vs PC2
+p_h3_12 <- ggplot(pcoa_df, aes(x = PC1, y = PC2, color = site)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = site), level = 0.95, linetype = "dashed") +
+  scale_color_manual(values = site_colors, name = "Site") +
+  labs(title = "PC1 vs PC2",
+       x = paste0("PC1 (", var_explained[1], "%)"),
+       y = paste0("PC2 (", var_explained[2], "%)")) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# PC1 vs PC3
+p_h3_13 <- ggplot(pcoa_df, aes(x = PC1, y = PC3, color = site)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = site), level = 0.95, linetype = "dashed") +
+  scale_color_manual(values = site_colors, name = "Site") +
+  labs(title = "PC1 vs PC3",
+       x = paste0("PC1 (", var_explained[1], "%)"),
+       y = paste0("PC3 (", var_explained[3], "%)")) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Build marginal subtitle from perm_full_marg (created in fix #1, section 7)
+overall_subtitle <- sprintf(
+  "PERMANOVA (marginal): site R\u00b2 = %.3f, F = %.3f, p = %.3f | year R\u00b2 = %.3f, F = %.3f, p = %.3f",
+  perm_full_marg$R2[1], perm_full_marg$F[1], perm_full_marg$`Pr(>F)`[1],
+  perm_full_marg$R2[2], perm_full_marg$F[2], perm_full_marg$`Pr(>F)`[2]
+)
+
+# Combined
+p_pcoa_humann <- (p_h3_12 | p_h3_13) +
+  plot_annotation(
+    title    = "Bray-Curtis PCoA - Functional Potential by Site",
+    subtitle = overall_subtitle,
+    caption  = paste0("40 samples | HUMAnN3 MetaCyc pathways | MMUPHin batch-corrected | ",
+                      "PC1+PC2 = ", var_explained[1]+var_explained[2], "%"),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(color = "grey40", size = 9),
+      plot.caption  = element_text(color = "grey40", size = 8, hjust = 0)
+    )
+  )
+
+p_pcoa_humann
+ggsave(paste0(OUTPUT_DIR, "/pcoa_humann3_corrected.png"),
+       p_pcoa_humann, width = 14, height = 6, dpi = 300)
+```
+
+## 9. PERMANOVA by site overall
+
+- how much does site explain when year isn't in the model at all?
+
+### PERMANOVA by site hypothesis
+
+H0: Epilithon functional community composition (MetaCyc pathway abundance) does not differ between sites (LEWI, MART, POSE, WALK)
+
+HA: Functional community composition differs in at least one site
+
+```{r}
+set.seed(123)
+perm_site <- adonis2(bc_dist_corrected ~ site,
+                     data = meta_aligned,
+                     permutations = 999)
+print(perm_site)
+```
+Interpretation: 
+
+- Functional community composition differs in at least one site - reject H0
+- Site explains 42.7% of total variance in MetaCyc pathway abundance (R²=0.427, F=8.958, p=0.001)
+- This is highly statistically significant (p=0.001)
+- The F statistic of 8.958 indicates strong separation between sites
+
+For writing:
+PERMANOVA revealed that site was a significant driver of epilithon functional community 
+composition (R²=0.427, F=8.958, p=0.001), explaining 42.7% of total variance in 
+Bray-Curtis dissimilarity of MetaCyc pathway abundances.
+
+
+## 10. PERMDISP by site
+
+- within each site, how spread out are the samples around their group centroid in multivariate space? Do some sites have more variable functional communities than others?
+
+### Hypothesis
+
+H0: The dispersion (variability) of functional community composition does not differ between sites
+
+HA: At least one site has significantly different dispersion from the others
+
+```{r}
+disp_site <- betadisper(bc_dist_corrected, meta_aligned$site)
+
+set.seed(123)
+perm_disp_site <- permutest(disp_site, permutations = 999)
+print(perm_disp_site)
+```
+
+```{r}
+# Visual
+plot(disp_site, main = "PERMDISP - functional dispersion by site",
+     col = c("#E41A1C", "#4DAF4A", "#984EA3", "#377EB8"))
+```
+
+
+```{r}
+boxplot(disp_site, 
+        col = c("#E41A1C", "#4DAF4A", "#984EA3", "#377EB8"),
+        main = "Distance to centroid by site",
+        ylab = "Distance to centroid")
+```
+
+- PERMDISP is significant (F=4.071, p=0.013) - reject H0
+- Sites differ significantly in their within-group dispersion (variability)
+- LEWI shows the highest dispersion - samples are most spread out from their centroid
+- POSE shows the lowest dispersion - most internally consistent functional community
+- WALK and MART are intermediate
+
+- This means the PERMANOVA result (site p=0.001) reflects BOTH differences in 
+  centroid location AND differences in within-site variability
+
+For writing:
+PERMDISP revealed significant differences in multivariate dispersion between sites 
+(F=4.071, p=0.013). LEWI exhibited the greatest within-site variability in functional 
+community composition, while POSE was the most internally consistent. The significant 
+dispersion result suggests that the PERMANOVA site effect reflects both compositional 
+differences between sites and differences in within-site functional variability. 
+LEWI's elevated dispersion is consistent with its smaller sample size (n=6) and 
+its geographic and hydrological distinctiveness among the four sites.
+
+
+## 11. PERMANOVA by year overall
+
+### Hypothesis
+
+- how much does year explain when site isn't in the model at all?
+
+H0: Epilithon functional community composition does not differ between years (2022, 2023)
+
+HA: Functional community composition differs between years
+
+```{r}
+set.seed(123)
+perm_year <- adonis2(bc_dist_corrected ~ year,
+                     data = meta_aligned,
+                     permutations = 999)
+print(perm_year)
+```
+Interpretation: 
+
+- Functional community composition does not differ between years.
+- Fail to reject H0 - functional community composition does not differ between years
+- Year explains only 0.7% of total variance (R²=0.007, F=0.281, p=0.996)
+- p=0.996 is extremely non-significant - year has no detectable effect on functional composition
+- This is consistent with the full marginal model result (year p=0.928)
+
+For writing:
+Year was not a significant driver of epilithon functional community composition in the 
+univariate model (PERMANOVA: R²=0.007, F=0.281, p=0.996), explaining less than 1% of 
+variance in Bray-Curtis dissimilarity of MetaCyc pathway abundances. This suggests that 
+functional potential of epilithon biofilms was stable across the two sampling years 
+after accounting for instrument batch effects.
+
+## 12. Per-site year PCoA and PERMANOVA
+
+### LEWI year analysis
+
+- Does functional community composition within LEWI differ between 
+  2022 and 2023? We already know from the overall PERMANOVA that year is a weak 
+  driver across all sites - now we ask whether that interannual signal exists 
+  specifically within LEWI.
+
+#### Hypothesis
+
+H0: Functional community composition at LEWI does not differ between 2022 and 2023
+
+HA: Functional community composition at LEWI differs between years
+
+```{r}
+# Subset corrected matrix to LEWI samples
+lewi_samples <- meta_aligned %>% filter(site == "LEWI") %>% rownames()
+path_LEWI <- path_corrected_t[lewi_samples, ]
+meta_LEWI <- meta_aligned[lewi_samples, ]
+
+# Bray-Curtis
+bc_LEWI <- vegdist(path_LEWI, method = "bray")
+
+# PCoA
+pcoa_LEWI <- cmdscale(bc_LEWI, eig = TRUE, k = 2)
+var_LEWI <- round(pcoa_LEWI$eig / sum(pcoa_LEWI$eig[pcoa_LEWI$eig > 0]) * 100, 1)
+
+# PERMANOVA ~ year
+set.seed(123)
+perm_LEWI_year <- adonis2(bc_LEWI ~ year, data = meta_LEWI, permutations = 999)
+print(perm_LEWI_year)
+```
+
+```{r}
+# Plot
+year_reds <- c("2022" = "#FFAAAA", "2023" = "#990000")
+
+pcoa_df_LEWI <- data.frame(
+  PC1       = pcoa_LEWI$points[, 1],
+  PC2       = pcoa_LEWI$points[, 2],
+  sample_id = rownames(pcoa_LEWI$points)
+) %>% left_join(meta, by = "sample_id")
+
+p_LEWI_year <- ggplot(pcoa_df_LEWI, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = year, color = year),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = year_reds, name = "Year") +
+  labs(title    = "LEWI - Functional PCoA by year",
+       subtitle = sprintf("PERMANOVA: R\u00b2 = %.3f, F = %.3f, p = %.3f",
+                   perm_LEWI_year$R2[1], perm_LEWI_year$F[1],
+                   perm_LEWI_year$`Pr(>F)`[1]),
+       x = paste0("PC1 (", var_LEWI[1], "%)"),
+       y = paste0("PC2 (", var_LEWI[2], "%)")) +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+print(p_LEWI_year)
+```
+
+# LEWI plot with convex hulls instead of ellipses
+```{r}
+# Calculate convex hulls for each year group
+hulls_LEWI <- pcoa_df_LEWI %>%
+  group_by(year) %>%
+  slice(chull(PC1, PC2))
+
+p_LEWI_year <- ggplot(pcoa_df_LEWI, aes(x = PC1, y = PC2)) +
+  geom_polygon(data = hulls_LEWI,
+               aes(fill = year, group = year),
+               alpha = 0.15) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  scale_color_manual(values = year_reds, name = "Year") +
+  scale_fill_manual(values = year_reds, name = "Year") +
+  labs(title    = "LEWI - Functional PCoA by year",
+       subtitle = sprintf("PERMANOVA: R\u00b2 = %.3f, F = %.3f, p = %.3f",
+                   perm_LEWI_year$R2[1], perm_LEWI_year$F[1],
+                   perm_LEWI_year$`Pr(>F)`[1]),
+       caption  = "Convex hulls shown in place of confidence ellipses (n=3 per group)",
+       x = paste0("PC1 (", var_LEWI[1], "%)"),
+       y = paste0("PC2 (", var_LEWI[2], "%)")) +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+print(p_LEWI_year)
+```
+
+Interpretation:
+- Fail to reject H₀ - year does not significantly drive functional composition at LEWI
+- 2022 shows wider spread than 2023 - consistent with the higher dispersion seen in PERMDISP
+- Substantial overlap between years supports non-significant result
+- Note: convex hulls used in place of ellipses due to n=3 per group
+- Note: only 719 permutations possible due to small sample size
+
+For writing:
+Within LEWI, year was not a significant driver of functional community composition 
+(PERMANOVA: R²=0.317, F=1.860, p=0.2). The 2022 samples showed greater spread in 
+ordination space than 2023, consistent with LEWI's elevated overall dispersion. 
+Convex hulls are shown in place of confidence ellipses due to the small sample 
+size at this site (n=3 per year).
+
+
+### MART year analysis
+
+- Does functional community composition within MART differ between
+  2022 and 2023? 
+
+#### Hypothesis
+
+H0: Functional community composition at MART does not differ between 2022 and 2023
+
+HA: Functional community composition at MART differs between years
+
+```{r}
+# Subset corrected matrix to MART samples
+mart_samples <- meta_aligned %>% filter(site == "MART") %>% rownames()
+path_MART <- path_corrected_t[mart_samples, ]
+meta_MART <- meta_aligned[mart_samples, ]
+
+# Bray-Curtis
+bc_MART <- vegdist(path_MART, method = "bray")
+
+# PCoA
+pcoa_MART <- cmdscale(bc_MART, eig = TRUE, k = 2)
+var_MART <- round(pcoa_MART$eig / sum(pcoa_MART$eig[pcoa_MART$eig > 0]) * 100, 1)
+
+# PERMANOVA ~ year
+set.seed(123)
+perm_MART_year <- adonis2(bc_MART ~ year, data = meta_MART, permutations = 999)
+print(perm_MART_year)
+```
+
+```{r}
+# Plot
+year_blues <- c("2022" = "#9EC4E0", "2023" = "#1A3D5C")
+
+pcoa_df_MART <- data.frame(
+  PC1       = pcoa_MART$points[, 1],
+  PC2       = pcoa_MART$points[, 2],
+  sample_id = rownames(pcoa_MART$points)
+) %>% left_join(meta, by = "sample_id")
+
+p_MART_year <- ggplot(pcoa_df_MART, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = year, color = year),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = year_blues, name = "Year") +
+  labs(title    = "MART - Functional PCoA by year",
+       subtitle = sprintf("PERMANOVA: R\u00b2 = %.3f, F = %.3f, p = %.3f",
+                   perm_MART_year$R2[1], perm_MART_year$F[1],
+                   perm_MART_year$`Pr(>F)`[1]),
+       x = paste0("PC1 (", var_MART[1], "%)"),
+       y = paste0("PC2 (", var_MART[2], "%)")) +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+print(p_MART_year)
+```
+
+Interpretation:
+- Fail to reject H0 - year does not significantly drive functional composition at MART
+- Year explains 9.6% of variance within MART (R²=0.096, F=1.381, p=0.194)
+- Ellipses overlap substantially - no clear year-based clustering visible
+- 2022 shows slightly wider spread than 2023
+
+For writing:
+Within MART, year was not a significant driver of functional community composition 
+(PERMANOVA: R²=0.096, F=1.381, p=0.194), explaining less than 10% of variance in 
+Bray-Curtis dissimilarity. The PCoA shows substantial overlap between years, 
+suggesting functional stability at MART across the two sampling years.
+
+
+### POSE year analysis
+
+- Does functional community composition within POSE differ between
+  2022 and 2023?
+
+#### Hypothesis
+
+H0: Functional community composition at POSE does not differ between 2022 and 2023
+
+HA: Functional community composition at POSE differs between years
+
+```{r}
+# Subset corrected matrix to POSE samples
+pose_samples <- meta_aligned %>% filter(site == "POSE") %>% rownames()
+path_POSE <- path_corrected_t[pose_samples, ]
+meta_POSE <- meta_aligned[pose_samples, ]
+
+# Bray-Curtis
+bc_POSE <- vegdist(path_POSE, method = "bray")
+
+# PCoA
+pcoa_POSE <- cmdscale(bc_POSE, eig = TRUE, k = 2)
+var_POSE <- round(pcoa_POSE$eig / sum(pcoa_POSE$eig[pcoa_POSE$eig > 0]) * 100, 1)
+
+# PERMANOVA ~ year
+set.seed(123)
+perm_POSE_year <- adonis2(bc_POSE ~ year, data = meta_POSE, permutations = 999)
+print(perm_POSE_year)
+```
+
+
+```{r}
+# Plot
+year_greens <- c("2022" = "#B8E4B8", "2023" = "#1F7A1F")
+
+pcoa_df_POSE <- data.frame(
+  PC1       = pcoa_POSE$points[, 1],
+  PC2       = pcoa_POSE$points[, 2],
+  sample_id = rownames(pcoa_POSE$points)
+) %>% left_join(meta, by = "sample_id")
+
+p_POSE_year <- ggplot(pcoa_df_POSE, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = year, color = year),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = year_greens, name = "Year") +
+  labs(title    = "POSE - Functional PCoA by year",
+       subtitle = sprintf("PERMANOVA: R\u00b2 = %.3f, F = %.3f, p = %.3f",
+                   perm_POSE_year$R2[1], perm_POSE_year$F[1],
+                   perm_POSE_year$`Pr(>F)`[1]),
+       x = paste0("PC1 (", var_POSE[1], "%)"),
+       y = paste0("PC2 (", var_POSE[2], "%)")) +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+print(p_POSE_year)
+```
+
+Interpretation:
+- Reject H0 - year significantly drives functional composition at POSE
+- Year explains 28.1% of variance within POSE (R²=0.281, F=3.129, p=0.009 **)
+- Clear separation between 2022 and 2023 visible in PCoA - ellipses do not overlap
+- This contrasts with LEWI and MART where year was not significant
+- POSE is the only site showing significant interannual functional turnover
+
+This explains why year was non-significant in the overall model - the POSE 
+signal is being diluted by the other three sites where year had no effect.
+
+For writing:
+Within POSE, year was a significant driver of functional community composition 
+(PERMANOVA: R²=0.281, F=3.129, p=0.009), explaining 28.1% of variance in 
+Bray-Curtis dissimilarity. The PCoA shows clear separation between 2022 and 2023 
+communities at POSE, with non-overlapping ellipses along PC1. This site-specific 
+interannual signal was not detectable in the overall model (year p=0.928), 
+suggesting that functional turnover at POSE was masked by stability at the 
+other three sites. This finding warrants further investigation into 
+environmental drivers of interannual functional change specific to POSE.
+
+
+### WALK year analysis
+
+- Does functional community composition within WALK differ between
+  2022 and 2023?
+
+#### Hypothesis
+
+H0: Functional community composition at WALK does not differ between 2022 and 2023
+
+HA: Functional community composition at WALK differs between years
+
+```{r}
+# Subset corrected matrix to WALK samples
+walk_samples <- meta_aligned %>% filter(site == "WALK") %>% rownames()
+path_WALK <- path_corrected_t[walk_samples, ]
+meta_WALK <- meta_aligned[walk_samples, ]
+
+# Bray-Curtis
+bc_WALK <- vegdist(path_WALK, method = "bray")
+
+# PCoA
+pcoa_WALK <- cmdscale(bc_WALK, eig = TRUE, k = 2)
+var_WALK <- round(pcoa_WALK$eig / sum(pcoa_WALK$eig[pcoa_WALK$eig > 0]) * 100, 1)
+
+# PERMANOVA ~ year
+set.seed(123)
+perm_WALK_year <- adonis2(bc_WALK ~ year, data = meta_WALK, permutations = 999)
+print(perm_WALK_year)
+```
+
+```{r}
+# Plot
+year_purples <- c("2022" = "#D4A8E0", "2023" = "#5B1A7A")
+
+pcoa_df_WALK <- data.frame(
+  PC1       = pcoa_WALK$points[, 1],
+  PC2       = pcoa_WALK$points[, 2],
+  sample_id = rownames(pcoa_WALK$points)
+) %>% left_join(meta, by = "sample_id")
+
+p_WALK_year <- ggplot(pcoa_df_WALK, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = year, color = year),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = year_purples, name = "Year") +
+  labs(title    = "WALK - Functional PCoA by year",
+       subtitle = sprintf("PERMANOVA: R\u00b2 = %.3f, F = %.3f, p = %.3f",
+                   perm_WALK_year$R2[1], perm_WALK_year$F[1],
+                   perm_WALK_year$`Pr(>F)`[1]),
+       x = paste0("PC1 (", var_WALK[1], "%)"),
+       y = paste0("PC2 (", var_WALK[2], "%)")) +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+print(p_WALK_year)
+```
+
+Interpretation:
+- Fail to reject H0 - year does not significantly drive functional composition at WALK
+- Year explains 11.4% of variance within WALK (R²=0.114, F=0.904, p=0.497)
+- Ellipses overlap substantially - no year-based clustering visible
+- 2023 ellipse is much wider than 2022, suggesting higher within-year variability in 2023
+
+For writing:
+Within WALK, year was not a significant driver of functional community composition 
+(PERMANOVA: R²=0.114, F=0.904, p=0.497). The PCoA shows substantial overlap 
+between years, with 2023 samples showing wider dispersion than 2022. Functional 
+community composition at WALK was stable across the two sampling years.
+
+## 13. Combined 4-panel per-site year PCoA
+```{r}
+library(patchwork)
+
+p_combined_sites <- (p_LEWI_year | p_MART_year) /
+                    (p_POSE_year  | p_WALK_year) +
+  plot_annotation(
+    title    = "Functional Community Composition by Year - Per Site",
+    subtitle = "Bray-Curtis PCoA | HUMAnN3 MetaCyc pathways | MMUPHin batch-corrected",
+    caption  = "LEWI: convex hulls shown (n=3 per group) | Ellipses = 95% confidence",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(color = "grey40", size = 9),
+      plot.caption  = element_text(color = "grey40", size = 8, hjust = 0)
+    )
+  )
+
+p_combined_sites
+
+ggsave(paste0(OUTPUT_DIR, "/pcoa_per_site_year_panel.png"),
+       p_combined_sites, width = 14, height = 12, dpi = 300)
+```
+
+## 14. PERMDISP by year within POSE
+
+### Hypothesis
+H0: The dispersion of functional community composition does not differ between 2022 and 2023 within POSE
+
+HA: Dispersion differs between years within POSE
+
+```{r}
+disp_POSE_year <- betadisper(bc_POSE, meta_POSE$year)
+
+set.seed(123)
+perm_disp_POSE_year <- permutest(disp_POSE_year, permutations = 999)
+print(perm_disp_POSE_year)
+```
+```{r}
+boxplot(disp_POSE_year,
+        col = c("#B8E4B8", "#1F7A1F"),
+        main = "POSE - Distance to centroid by year",
+        ylab = "Distance to centroid")
+```
+
+Interpretation:
+- Fail to reject H₀ - dispersion does not significantly differ between years at POSE 
+  (F=2.275, p=0.147)
+- This strengthens the PERMANOVA result - the significant year effect at POSE 
+  reflects true compositional differences between centroids, not dispersion artifacts
+- 2023 shows visually wider spread than 2022 in the boxplot, but this difference 
+  is not statistically significant
+- The POSE PERMANOVA result (p=0.009) is therefore robust
+
+For writing:
+PERMDISP confirmed that the significant year effect at POSE (PERMANOVA: p=0.009) 
+reflects true differences in community composition between years rather than 
+differences in within-group dispersion (PERMDISP: F=2.275, p=0.147). Although 
+2023 samples showed slightly greater spread around their centroid than 2022, 
+this difference was not statistically significant, supporting the interpretation 
+that epilithon functional communities at POSE underwent genuine compositional 
+shifts between 2022 and 2023.
+
+
+# 1. Pathway Richness (Alpha Diversity)
+
+Question: Does the number of detected MetaCyc pathways differ between sites and years? This measures within-sample functional 
+diversity - how many unique metabolic pathways are present in each epilithon community.
+
+Note: For HUMAnN3 functional data we use pathway richness (number of pathways with abundance > 0) rather than Shannon diversity, because pathway presence/absence is more biologically meaningful than evenness for functional potential.
+
+```{r}
+# Calculate pathway richness per sample
+# Count pathways with CPM > 0 for each sample
+richness_df <- humann_path_unstrat %>%
+  column_to_rownames("Pathway") %>%
+  summarise(across(everything(), ~ sum(. > 0))) %>%
+  pivot_longer(everything(), 
+               names_to = "sample_id", 
+               values_to = "pathway_richness") %>%
+  left_join(meta, by = "sample_id")
+
+# Summary by site
+cat("Pathway richness summary by site:\n")
+print(richness_df %>%
+  group_by(site) %>%
+  summarise(mean   = round(mean(pathway_richness), 1),
+            sd     = round(sd(pathway_richness), 1),
+            min    = min(pathway_richness),
+            max    = max(pathway_richness)))
+
+# Summary by year
+cat("\nPathway richness summary by year:\n")
+print(richness_df %>%
+  group_by(year) %>%
+  summarise(mean   = round(mean(pathway_richness), 1),
+            sd     = round(sd(pathway_richness), 1),
+            min    = min(pathway_richness),
+            max    = max(pathway_richness)))
+```
+
+
+### Statistical tests on pathway richness
+
+H0 (site): Pathway richness does not differ between sites.
+HA (site): Pathway richness differs in at least one site.
+
+H0 (year): Pathway richness does not differ between 2022 and 2023.
+HA (year): Pathway richness differs between years.
+
+```{r}
+library(rstatix)
+library(ggpubr)
+
+# Site comparison: 4 groups, KW + Dunn's with BH correction
+cat("\n--- Kruskal-Wallis: pathway richness ~ site ---\n")
+kw_site_richness <- kruskal.test(pathway_richness ~ site, data = richness_df)
+print(kw_site_richness)
+
+cat("\n--- Dunn's post-hoc with BH correction ---\n")
+dunn_site_richness <- richness_df %>%
+  rstatix::dunn_test(pathway_richness ~ site, p.adjust.method = "BH")
+print(dunn_site_richness)
+
+# Year comparison: 2 groups, KW + Wilcoxon
+cat("\n--- Kruskal-Wallis: pathway richness ~ year ---\n")
+kw_year_richness <- kruskal.test(pathway_richness ~ year, data = richness_df)
+print(kw_year_richness)
+
+cat("\n--- Wilcoxon rank-sum: pathway richness ~ year ---\n")
+wilcox_year_richness <- wilcox.test(pathway_richness ~ year, data = richness_df)
+print(wilcox_year_richness)
+```
+
+
+### Pathway richness boxplots
+
+```{r}
+# Site colors (in case this chunk is run standalone)
+site_colors <- c("LEWI" = "#E41A1C", "MART" = "#377EB8",
+                 "POSE" = "#4DAF4A", "WALK" = "#984EA3")
+year_reds   <- c("2022" = "#FFAAAA", "2023" = "#990000")
+
+# Site boxplot with Dunn's BH brackets
+dunn_sig_site <- dunn_site_richness %>%
+  filter(p.adj < 0.05) %>%
+  mutate(label = paste0("p=", round(p.adj, 4)))
+
+p_richness_site <- ggplot(richness_df,
+                          aes(x = site, y = pathway_richness, fill = site)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = year), width = 0.15, size = 2.5) +
+  stat_pvalue_manual(dunn_sig_site,
+                     label = "label",
+                     y.position = seq(max(richness_df$pathway_richness) + 15,
+                                      max(richness_df$pathway_richness) + 15 + 10 * (nrow(dunn_sig_site) - 1),
+                                      length.out = nrow(dunn_sig_site)),
+                     tip.length = 0.01,
+                     size = 3) +
+  scale_fill_manual(values = site_colors, name = "Site") +
+  scale_color_manual(values = c("2022" = "#333333", "2023" = "#888888"),
+                     name = "Year") +
+  labs(title    = "Pathway richness by site",
+       subtitle = paste0("Kruskal-Wallis p = ",
+                  round(kw_site_richness$p.value, 4),
+                  " | Brackets = Dunn's post-hoc, BH corrected"),
+       x = "Site", y = "Number of detected MetaCyc pathways") +
+  theme_bw(base_size = 13) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+print(p_richness_site)
+
+# Year boxplot with Wilcoxon bracket
+p_richness_year <- ggplot(richness_df,
+                          aes(x = year, y = pathway_richness, fill = year)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = site), width = 0.15, size = 2.5) +
+  stat_compare_means(comparisons = list(c("2022", "2023")),
+                     method = "wilcox.test",
+                     label = "p.format",
+                     bracket.size = 0.5) +
+  scale_fill_manual(values = year_reds, name = "Year") +
+  scale_color_manual(values = site_colors, name = "Site") +
+  labs(title    = "Pathway richness by year",
+       subtitle = paste0("Kruskal-Wallis p=", round(kw_year_richness$p.value, 4),
+                         " | Wilcoxon p=", round(wilcox_year_richness$p.value, 4),
+                         " (bracket)"),
+       x = "Year", y = "Number of detected MetaCyc pathways") +
+  theme_bw(base_size = 13) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+print(p_richness_year)
+```
+
+
+```{r}
+OUTPUT_DIR <- "~/Documents/NEON/March_final/humann3/figures/"
+# (or whatever your existing OUTPUT_DIR is - check the top of the Rmd)
+
+ggsave(paste0(OUTPUT_DIR, "pathway_richness_by_site.png"),
+       p_richness_site,
+       width = 8, height = 6)
+
+ggsave(paste0(OUTPUT_DIR, "pathway_richness_by_year.png"),
+       p_richness_year,
+       width = 6, height = 6)
+
+# Combined 2-panel for the chapter
+library(patchwork)
+p_richness_combined <- (p_richness_site | p_richness_year) +
+  plot_layout(guides = "collect", widths = c(1.4, 1)) +
+  plot_annotation(
+    title    = "Functional alpha diversity (pathway richness)",
+    subtitle = paste0("Wilcoxon rank-sum p=", round(wilcox_year_richness$p.value, 4)),
+    theme = theme(plot.title    = element_text(face = "bold", size = 14),
+                  plot.subtitle = element_text(color = "grey40", size = 9))
+  )
+
+ggsave(paste0(OUTPUT_DIR, "pathway_richness_combined.png"),
+       p_richness_combined,
+       width = 13, height = 6)
+
+p_richness_combined
+```
+
+
+## 15. Differential Abundance - MaAsLin2
+
+- For each MetaCyc pathway, is its abundance significantly different between groups?
+
+- MaAsLin2 fits a linear model for each of the 656 pathways individually, testing whether pathway abundance is significantly associated with site or year. 
+
+- Null and alternative hypotheses:
+
+For site:
+
+H0: The abundance of pathway X does not differ between sites (LEWI, MART, POSE, WALK) after controlling for year
+
+HA: The abundance of pathway X differs significantly in at least one site compared to the reference site (LEWI)
+
+For year:
+
+H0: The abundance of pathway X does not differ between 2022 and 2023 after controlling for site
+
+HA: The abundance of pathway X differs significantly between years
+
+- Why q ≤ 0.25 and not 0.05?
+With 656 pathways being tested, many false positives would occur at p=0.05. FDR correction controls the expected proportion of false discoveries. MaAsLin2's default threshold of 0.25 means up to 25% of significant results could be false positives - this is standard for exploratory microbiome research.
+
+```{r}
+maaslin_input <- as.data.frame(t(path_corrected))
+
+maaslin_meta <- meta %>%
+  column_to_rownames("sample_id") %>%
+  select(site, year) %>%
+  mutate(year = factor(year))
+
+maaslin_input <- maaslin_input[rownames(maaslin_meta), ]
+
+fit <- Maaslin2(
+  input_data     = maaslin_input,
+  input_metadata = maaslin_meta,
+  output         = paste0(OUTPUT_DIR, "/maaslin2_results"),
+  fixed_effects  = c("site", "year"),
+  reference      = "site,LEWI;year,2022",
+  normalization  = "NONE",
+  transform      = "LOG",
+  min_prevalence = 0.1,
+  standardize    = FALSE,
+  cores          = 1
+)
+```
+
+```{r}
+# How many significant associations?
+sig <- read.table(paste0(OUTPUT_DIR, "/maaslin2_results/significant_results.tsv"),
+                  header = TRUE, sep = "\t")
+nrow(sig)
+table(sig$metadata)
+
+# Top 10 significant results
+head(sig[order(sig$qval), ], 10)
+```
+Interpretation:
+
+- 1,006 significant pathway associations detected (q ≤ 0.25)
+- 874 site associations, 132 year associations
+- Site drives far more differential pathway abundance than year
+  - consistent with PERMANOVA results
+- Top site-associated pathways include amino acid biosynthesis 
+  and nitrifier denitrification - ecologically meaningful for 
+  stream biofilm communities
+- Negative coefficients = lower abundance relative to LEWI
+
+```{r}
+library(tidyverse)
+
+# Read the FULL results table, not just significant
+maaslin_all <- read_tsv("~/Documents/NEON/March_final/humann3/maaslin2_results/all_results.tsv")
+
+# Same cleaning function as before
+clean_pathway <- function(x) {
+  x %>%
+    str_replace("^[A-Z0-9.]+\\.\\.+", "") %>%
+    str_replace_all("\\.+", " ") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_trim() %>%
+    str_to_sentence() %>%
+    str_replace_all("\\bIi\\b", "II") %>%
+    str_replace_all("\\bIii\\b", "III") %>%
+    str_replace_all("\\bIv\\b", "IV") %>%
+    str_replace_all("\\bVi\\b", "VI") %>%
+    str_replace_all("\\bVii\\b", "VII") %>%
+    str_replace_all("\\bL\\s", "L-") %>%
+    str_replace_all("\\bD\\s", "D-")
+}
+
+heatmap_df <- maaslin_all %>%
+  mutate(pathway_clean = clean_pathway(feature),
+         signed_log_q  = -log10(qval) * sign(coef),
+         signif_marker = ifelse(qval < 0.25, "*", ""),
+         covariate_label = case_when(
+           metadata == "site" ~ paste0(value, "\nvs. LEWI"),
+           metadata == "year" ~ paste0(value, "\nvs. 2022"),
+           TRUE ~ paste(metadata, value)
+         ))
+
+# Top 20 by best q-value across any covariate
+top_pathways <- heatmap_df %>%
+  group_by(pathway_clean) %>%
+  summarize(min_q = min(qval, na.rm = TRUE)) %>%
+  arrange(min_q) %>%
+  slice_head(n = 20) %>%
+  pull(pathway_clean)
+
+heatmap_df <- heatmap_df %>%
+  filter(pathway_clean %in% top_pathways)
+
+# Order pathways by direction of strongest effect
+pathway_order <- heatmap_df %>%
+  group_by(pathway_clean) %>%
+  summarize(strongest = signed_log_q[which.max(abs(signed_log_q))]) %>%
+  arrange(strongest) %>%
+  pull(pathway_clean)
+heatmap_df$pathway_clean <- factor(heatmap_df$pathway_clean, levels = pathway_order)
+
+col_order <- c("MART\nvs. LEWI", "POSE\nvs. LEWI", "WALK\nvs. LEWI", "2023\nvs. 2022")
+heatmap_df$covariate_label <- factor(heatmap_df$covariate_label, levels = col_order)
+
+fill_limit <- max(abs(heatmap_df$signed_log_q), na.rm = TRUE)
+
+p_maaslin_heatmap <- ggplot(heatmap_df,
+                            aes(x = covariate_label,
+                                y = pathway_clean,
+                                fill = signed_log_q)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = paste0(sprintf("%+.1f", signed_log_q), signif_marker),
+                color = abs(signed_log_q) > fill_limit * 0.5),
+            size = 2.8, show.legend = FALSE) +
+  scale_color_manual(values = c("TRUE" = "white", "FALSE" = "black")) +
+  scale_fill_gradient2(low      = "#2166AC",
+                       mid      = "white",
+                       high     = "#B2182B",
+                       midpoint = 0,
+                       limits   = c(-fill_limit, fill_limit),
+                       name     = expression(-log[10](q) %*% sign(coef))) +
+  labs(title    = "Differentially abundant MetaCyc pathways",
+       subtitle = "MaAsLin2 | HUMAnN3 batch-corrected | top 20 pathways by minimum q-value",
+       caption  = "Reference categories: site = LEWI, year = 2022. Asterisks mark q < 0.25.",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x       = element_text(size = 10, lineheight = 0.9),
+        axis.text.y       = element_text(size = 9),
+        plot.title        = element_text(face = "bold", size = 13),
+        plot.subtitle     = element_text(color = "grey40", size = 9),
+        plot.caption      = element_text(color = "grey40", size = 8, hjust = 0),
+        panel.grid        = element_blank())
+
+print(p_maaslin_heatmap)
+
+ggsave(paste0(OUTPUT_DIR, "maaslin_pathway_heatmap.png"),
+       p_maaslin_heatmap,
+       width = 11, height = 8.5)
+
+```
+
+
+```{r maaslin_panels, fig.width=11, fig.height=6.5}
+library(tidyverse)
+library(patchwork)
+
+# -------- Paths --------
+FIG_DIR <- "~/Documents/NEON/March_final/humann3/figures/"
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# -------- Helper: name normalization --------
+normalize_name <- function(x) {
+  x %>%
+    str_replace("^X", "") %>%
+    str_replace_all("[^A-Za-z0-9]+", ".") %>%
+    str_replace_all("\\.+", ".") %>%
+    str_replace_all("^\\.|\\.$", "") %>%
+    str_to_lower()
+}
+
+# -------- Helper: pathway name cleaning --------
+clean_pathway <- function(x) {
+  x <- str_replace(x, "^[A-Z0-9.]+\\.\\.+", "")
+  x <- str_replace_all(x, "\\.+", " ")
+  x <- str_replace_all(x, "\\s+", " ")
+  x <- str_trim(x)
+  x <- str_to_sentence(x)
+  x <- gsub("\\b[Ii]v\\b",  "IV",  x)
+  x <- gsub("\\b[Ii]ii\\b", "III", x)
+  x <- gsub("\\b[Ii]i\\b",  "II",  x)
+  x <- gsub("\\b[Vv]ii\\b", "VII", x)
+  x <- gsub("\\b[Vv]i\\b",  "VI",  x)
+  x <- gsub("\\bL\\s",      "L-",  x)
+  x <- gsub("\\bD\\s",      "D-",  x)
+  x <- gsub("\\bTca\\b",    "TCA", x)
+  x <- gsub("\\bCtp\\b",    "CTP", x)
+  x <- gsub("\\bAtp\\b",    "ATP", x)
+  x
+}
+
+# -------- Read MaAsLin2 results --------
+maaslin_all <- read_tsv("~/Documents/NEON/March_final/humann3/maaslin2_results/all_results.tsv")
+
+# ============================================================
+# PANEL B: Top 6 year-differential pathways
+# ============================================================
+
+year_top_features <- maaslin_all %>%
+  filter(metadata == "year", qval < 0.25) %>%
+  arrange(qval) %>%
+  slice_head(n = 6) %>%
+  pull(feature)
+
+year_top_lookup <- tibble(
+  feature_orig  = year_top_features,
+  feature_norm  = normalize_name(year_top_features),
+  pathway_clean = clean_pathway(year_top_features)
+)
+
+manual_short_names <- c(
+  "Superpathway of cytosolic glycolysis plants pyruvate dehydrogenase and tca cycle" =
+    "Glycolysis + PDH + TCA",
+  "Superpathway of glycolysis pyruvate dehydrogenase tca and glyoxylate bypass" =
+    "Glycolysis + PDH + TCA + glyoxylate",
+  "Superpathway of hexitol degradation bacteria" =
+    "Hexitol degradation",
+  "Superpathway of menaquinol 8 biosynthesis II" =
+    "Menaquinol-8 biosynthesis II",
+  "Peptidoglycan biosynthesis v beta lactam resistance" =
+    "Peptidoglycan biosynthesis V (beta-lactam resistance)",
+  "Cis geranyl coa degradation" =
+    "Cis-geranyl-CoA degradation"
+)
+
+year_top_lookup <- year_top_lookup %>%
+  mutate(pathway_clean = ifelse(pathway_clean %in% names(manual_short_names),
+                                manual_short_names[pathway_clean],
+                                pathway_clean))
+
+year_abundance_long <- path_corrected_t %>%
+  as.data.frame() %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(cols = -sample, names_to = "feature", values_to = "abundance") %>%
+  mutate(feature_norm = normalize_name(feature)) %>%
+  filter(feature_norm %in% year_top_lookup$feature_norm) %>%
+  left_join(meta_aligned %>%
+              as.data.frame() %>%
+              rownames_to_column("sample"),
+            by = "sample") %>%
+  left_join(year_top_lookup, by = "feature_norm") %>%
+  mutate(pathway_clean = factor(pathway_clean,
+                                levels = year_top_lookup$pathway_clean))
+
+year_star_y_pos <- year_abundance_long %>%
+  group_by(pathway_clean) %>%
+  summarize(y_pos = max(abundance) * 1.05, .groups = "drop")
+
+year_stars_B <- maaslin_all %>%
+  filter(metadata == "year") %>%
+  mutate(feature_norm = normalize_name(feature)) %>%
+  filter(feature_norm %in% year_top_lookup$feature_norm) %>%
+  left_join(year_top_lookup, by = "feature_norm") %>%
+  mutate(stars = case_when(
+    qval < 0.001 ~ "***",
+    qval < 0.01  ~ "**",
+    qval < 0.05  ~ "*",
+    qval < 0.25  ~ ".",
+    TRUE         ~ "ns"
+  )) %>%
+  select(pathway_clean, stars) %>%
+  left_join(year_star_y_pos, by = "pathway_clean") %>%
+  mutate(pathway_clean = factor(pathway_clean,
+                                levels = year_top_lookup$pathway_clean))
+
+p_B <- ggplot(year_abundance_long,
+              aes(x = year, y = abundance)) +
+  geom_boxplot(fill = NA, color = "grey30", outlier.size = 0.8, linewidth = 0.5) +
+  geom_jitter(aes(color = site), width = 0.15, size = 1.5, alpha = 0.9) +
+  geom_text(data = year_stars_B,
+            aes(x = 1.5, y = y_pos, label = stars),
+            inherit.aes = FALSE,
+            size = 5, color = "black") +
+  facet_wrap(~ pathway_clean, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = site_colors, name = "Site") +
+  labs(title    = "Top 6 year-differential pathways",
+       subtitle = "Stars indicate BH-adjusted p-value, 2023 vs 2022 (2022 = reference)",
+       caption  = "*** p-adj<0.001, ** p-adj<0.01, * p-adj<0.05, . p-adj<0.25, ns = not significant",
+       x        = NULL,
+       y        = "Relative abundance (batch-corrected)") +
+  theme_bw(base_size = 10) +
+  theme(plot.title      = element_text(face = "bold", size = 11),
+        plot.subtitle   = element_text(color = "grey40", size = 9),
+        plot.caption    = element_text(color = "grey40", size = 8, hjust = 0),
+        strip.text      = element_text(size = 8),
+        axis.text.x     = element_text(size = 9),
+        legend.position = "right")
+
+ggsave(paste0(FIG_DIR, "maaslin_panelB_pathways_by_year.png"),
+       p_B, width = 11, height = 6.5)
+
+print(p_B)
+
+# ============================================================
+# PANEL C: Mean abundance per site for top 8 site-differential pathways
+# ============================================================
+
+sig_pathways <- maaslin_all %>%
+  filter(metadata == "site", qval < 0.25) %>%
+  group_by(feature) %>%
+  summarize(max_abs_coef = max(abs(coef)), .groups = "drop") %>%
+  arrange(desc(max_abs_coef)) %>%
+  slice_head(n = 8) %>%
+  pull(feature)
+
+sig_lookup <- tibble(
+  feature_orig  = sig_pathways,
+  feature_norm  = normalize_name(sig_pathways),
+  pathway_clean = clean_pathway(sig_pathways)
+)
+
+panel_c_short_names <- c(
+  "Mannosylglycerate biosynthesis i" =
+    "Mannosylglycerate biosynthesis I",
+  "Formaldehyde assimilation i serine pathway" =
+    "Formaldehyde assimilation I (serine)",
+  "Photosynthetic 3 hydroxybutanoate biosynthesis engineered" =
+  "Photosynthetic 3-hydroxybutanoate",
+  "Ceramide degradation by alpha oxidation" =
+    "Ceramide degradation (alpha-oxidation)",
+  "Pyruvate fermentation to butanoate" =
+    "Pyruvate fermentation to butanoate",
+  "L isoleucine biosynthesis IV" =
+    "L-isoleucine biosynthesis IV",
+  "L lysine biosynthesis III" =
+    "L-lysine biosynthesis III",
+  "Nitrifier denitrification" =
+    "Nitrifier denitrification"
+)
+
+sig_lookup <- sig_lookup %>%
+  mutate(pathway_clean = ifelse(pathway_clean %in% names(panel_c_short_names),
+                                panel_c_short_names[pathway_clean],
+                                pathway_clean))
+
+site_panel_data <- path_corrected_t %>%
+  as.data.frame() %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(cols = -sample, names_to = "feature", values_to = "abundance") %>%
+  mutate(feature_norm = normalize_name(feature)) %>%
+  filter(feature_norm %in% sig_lookup$feature_norm) %>%
+  left_join(meta_aligned %>%
+              as.data.frame() %>%
+              rownames_to_column("sample"),
+            by = "sample") %>%
+  left_join(sig_lookup, by = "feature_norm") %>%
+  group_by(pathway_clean, site) %>%
+  summarize(mean_ab = mean(abundance),
+            se_ab   = sd(abundance) / sqrt(n()),
+            .groups = "drop")
+
+site_stars_simple <- maaslin_all %>%
+  filter(metadata == "site") %>%
+  mutate(feature_norm = normalize_name(feature)) %>%
+  filter(feature_norm %in% sig_lookup$feature_norm) %>%
+  left_join(sig_lookup, by = "feature_norm") %>%
+  mutate(stars = case_when(
+    qval < 0.001 ~ "***",
+    qval < 0.01  ~ "**",
+    qval < 0.05  ~ "*",
+    qval < 0.25  ~ ".",
+    TRUE         ~ ""
+  )) %>%
+  rename(site = value) %>%
+  select(pathway_clean, site, stars)
+
+site_panel_data <- site_panel_data %>%
+  left_join(site_stars_simple, by = c("pathway_clean", "site")) %>%
+  mutate(stars   = ifelse(is.na(stars), "", stars),
+         star_y  = mean_ab + se_ab + max(mean_ab) * 0.10)
+
+p_C <- ggplot(site_panel_data,
+              aes(x = site, y = mean_ab, fill = site)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = mean_ab - se_ab, ymax = mean_ab + se_ab),
+                width = 0.25, color = "grey30", linewidth = 0.4) +
+  geom_text(aes(y = star_y, label = stars),
+            size = 4, color = "black") +
+  facet_wrap(~ pathway_clean, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = site_colors, name = "Site") +
+  labs(title    = "Mean pathway abundance by site",
+       subtitle = "Top 8 site-differential pathways | stars = BH-adjusted p-value vs LEWI",
+       caption  = "*** p-adj<0.001, ** p-adj<0.01, * p-adj<0.05, . p-adj<0.25",
+       x        = NULL,
+       y        = "Mean relative abundance \u00b1 SE") +
+  theme_bw(base_size = 10) +
+  theme(plot.title      = element_text(face = "bold", size = 11),
+        plot.subtitle   = element_text(color = "grey40", size = 9),
+        plot.caption    = element_text(color = "grey40", size = 8, hjust = 0),
+        strip.text      = element_text(size = 9),
+        axis.text.x     = element_text(size = 9),
+        legend.position = "none")
+
+ggsave(paste0(FIG_DIR, "maaslin_panelC_site_means.png"),
+       p_C, width = 12, height = 6.5)
+
+print(p_C)
+```
+ 
+
+
+## 16. Sample Similarity Network - Functional Potential
+# Question: Which samples share similar functional community profiles,
+# and do samples cluster by site in network space?
+
+# Method: Spearman correlation between samples based on pathway abundance,
+# edges drawn between samples with correlation above threshold,
+# nodes colored by site
+
+```{r}
+# ============================================================
+# Sample similarity network (Spearman ρ ≥ 0.95)
+# ============================================================
+library(igraph)
+
+# Spearman correlation between samples (columns of corrected matrix)
+sample_cor <- cor(path_corrected, method = "spearman")
+
+# Threshold: keep only strong positive correlations
+adj <- sample_cor
+adj[adj < 0.95] <- 0
+diag(adj) <- 0  # remove self-loops
+
+# Build undirected weighted graph
+net <- graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE)
+
+cat("Network: ", vcount(net), "nodes,", ecount(net), "edges\n")
+```
+
+```{r}
+tg <- as_tbl_graph(net) %>%
+  activate(nodes) %>%
+  mutate(
+    site = meta$site[match(name, meta$sample_id)],
+    year = as.character(meta$year[match(name, meta$sample_id)])
+  )
+
+set.seed(123)
+p_network <- ggraph(tg, layout = "fr") +
+  geom_edge_link(aes(width = weight), color = "black", alpha = 1) +
+  geom_node_point(aes(color = site, shape = year), size = 8) +
+  scale_color_manual(values = site_colors, name = "Site") +
+  scale_shape_manual(values = c("2022" = 16, "2023" = 17), name = "Year") +
+  scale_edge_width(range = c(0.3, 1.5), guide = "none") +
+  theme_graph(base_family = "sans") +
+  labs(title    = "Sample Similarity Network - Functional Potential",
+       subtitle = "Spearman \u03c1 \u2265 0.95 | nodes = samples | edges = high functional similarity") +
+  theme(plot.title    = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_network
+ggsave(paste0(OUTPUT_DIR, "/network_sample_similarity.png"),
+       p_network, width = 8, height = 7, dpi = 300)
+
+```
+- MART (blue) clusters tightly on the left
+- POSE + LEWI (green + red) cluster together on the right
+- WALK (purple) sits in between, connecting both clusters
+- Isolated nodes are samples with unique functional profiles - notably the LEWI samples
+
+## 17. Pathway Co-occurrence Network
+
+Question: Which MetaCyc pathways co-occur across samples suggesting functional coupling, and do functionally coupled pathways reflect known biological modules?
+
+```{r}
+# Use top 50 most variable pathways to keep network readable
+path_var <- apply(path_corrected, 1, var)
+top50 <- names(sort(path_var, decreasing = TRUE)[1:50])
+path_top50 <- path_corrected[top50, ]
+
+# Spearman correlation between pathways across samples
+pathway_cor <- cor(t(path_top50), method = "spearman")
+diag(pathway_cor) <- 0
+
+# Threshold
+pw_threshold <- 0.7
+pathway_adj <- pathway_cor
+pathway_adj[abs(pathway_adj) < pw_threshold] <- 0
+
+# Build network using absolute correlations for layout
+pw_net <- graph_from_adjacency_matrix(abs(pathway_adj),
+                                      mode     = "undirected",
+                                      weighted = TRUE,
+                                      diag     = FALSE)
+
+# Clean up pathway names for labels
+V(pw_net)$label <- gsub(".*\\.\\.", "", V(pw_net)$name)
+V(pw_net)$label <- gsub("\\.", " ", V(pw_net)$label)
+V(pw_net)$label <- stringr::str_trunc(V(pw_net)$label, 30)
+
+# Color by degree (connectivity)
+V(pw_net)$degree <- degree(pw_net)
+
+# Convert to tidygraph
+pw_tg <- as_tbl_graph(pw_net)
+
+set.seed(123)
+p_pw_network <- ggraph(pw_tg, layout = "fr") +
+  geom_edge_link(color = "black", alpha = 0.3, width = 0.5) +
+  geom_node_point(aes(size = degree, color = degree)) +
+  geom_node_text(aes(label = label), size = 2.5, repel = TRUE,
+                 max.overlaps = 20) +
+  scale_color_gradient(low = "#4DAF4A", high = "#E41A1C", name = "Connections") +
+  scale_size(range = c(3, 10), name = "Connections", guide = "none") +
+  theme_graph(base_family = "sans") +
+  labs(title    = "Pathway Co-occurrence Network - Functional Potential",
+       subtitle = "Top 50 most variable pathways | Spearman ρ ≥ 0.70 | node size = connectivity") +
+  theme(plot.title    = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_pw_network
+ggsave(paste0(OUTPUT_DIR, "/network_pathway_cooccurrence.png"),
+       p_pw_network, width = 12, height = 10, dpi = 300)
+
+```
+
+Export network data from R
+```{r}
+# Export edge list
+edges <- as_data_frame(pw_net, what = "edges")
+write_csv(edges, paste0(OUTPUT_DIR, "/pathway_network_edges.csv"))
+
+# Export node list  
+nodes <- as_data_frame(pw_net, what = "vertices")
+write_csv(nodes, paste0(OUTPUT_DIR, "/pathway_network_nodes.csv"))
+
+write_graph(pw_net, 
+            paste0(OUTPUT_DIR, "/pathway_network.graphml"), 
+            format = "graphml")
+```
+
+```{r}
+library(tidyverse)
+
+# Build the data frame from your MaAsLin2 results
+maaslin_counts <- tibble(
+  metadata = c("Site", "Year"),
+  n        = c(874, 132)
+) %>%
+  mutate(metadata = factor(metadata, levels = c("Site", "Year")))
+
+p_counts <- ggplot(maaslin_counts, aes(x = metadata, y = n, fill = metadata)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = n), 
+            vjust = -0.4, 
+            size = 6, 
+            fontface = "bold") +
+  scale_fill_manual(values = c("Site" = "#2C5F8D", "Year" = "#B0B0B0"),
+                    guide = "none") +
+  scale_y_continuous(limits = c(0, 950), expand = c(0, 0)) +
+  labs(title    = "Differentially abundant pathways by covariate",
+       subtitle = "MaAsLin2 | q \u2264 0.25",
+       x        = NULL,
+       y        = "Number of significant associations") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(color = "grey40", size = 10),
+        axis.text.x   = element_text(size = 12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank())
+
+print(p_counts)
+
+ggsave(paste0(OUTPUT_DIR, "/maaslin_counts_bar.png"),
+       p_counts, width = 5, height = 4)
+```

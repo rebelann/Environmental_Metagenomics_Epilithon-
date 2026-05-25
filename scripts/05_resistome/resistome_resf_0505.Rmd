@@ -1,0 +1,398 @@
+---
+title: "Resfinder analysis"
+output: html_document
+date: "2026-05-05"
+author: "Rebekah Lanning"
+---
+
+
+# ResFinder Resistome Analysis (Resfinder)
+# NEON Epilithon Shotgun Metagenomics
+# Sites: LEWI, MART, POSE, WALK | Years: 2022-2023
+
+NEON Epilithon Shotgun Metagenomics
+Sites: LEWI, MART, POSE, WALK | Years: 2022-2023
+
+Framing: One Health surveillance with WHO Critically Important Antimicrobials (WHO 2019, 6th Revision) prioritization. Descriptive (not inferential) analysis given the sparse clinically-curated detection set.
+
+## 1. Load Libraries
+
+```{r setup-resistome, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(patchwork)
+library(rstatix)
+library(ggpubr)
+```
+
+## 2. Set File Paths
+
+```{r resistome-paths}
+RESFINDER_FILE <- "~/Documents/NEON/March_final/Kraken2_Bracken/Resfinder/Resfinderresfinder_clean.csv"
+METADATA_FILE  <- "~/Documents/NEON/March_final/metadata/shotgun/filtered_metadata_metagenomes.tsv"
+MANIFEST_FILE  <- "~/Documents/NEON/March_final/metadata/shotgun/shotgun_manifest.tsv"
+FIG_DIR        <- "~/Documents/NEON/March_final/Resfinder_0505/figures/"
+OUTPUT_DIR     <- "~/Documents/NEON/March_final/Resfinder_0505/"
+
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 3. Canonical Chapter Palettes
+
+```{r resistome-palettes}
+site_colors <- c(LEWI = "#E41A1C", MART = "#377EB8",
+                 POSE = "#4DAF4A", WALK = "#984EA3")
+year_reds   <- c(`2022` = "#FCC5C0", `2023` = "#A50F15")
+```
+
+## 4. Load Data
+
+```{r load-resistome}
+resfinder <- read_csv(RESFINDER_FILE, show_col_types = FALSE)
+
+metadata <- read_tsv(METADATA_FILE, show_col_types = FALSE) %>%
+  filter(year != 2021)
+
+manifest <- read_tsv(MANIFEST_FILE, show_col_types = FALSE) %>%
+  filter(year != 2021) %>%
+  mutate(sample = gsub("_R1\\.fastq\\.gz$", "", R1))
+
+# Build the 40-sample metadata frame keyed by sample
+meta <- manifest %>%
+  left_join(metadata %>% select(dnaSampleID, sampleFilteredReadNumber,
+                                instrument_model),
+            by = "dnaSampleID") %>%
+  mutate(site = factor(site, levels = c("LEWI", "MART", "POSE", "WALK")),
+         year = factor(year, levels = c("2022", "2023"))) %>%
+  select(sample, site, year, sampleFilteredReadNumber, instrument_model)
+
+cat("Samples in metadata:", nrow(meta), "\n")
+cat("Detections in resfinder:", nrow(resfinder), "\n")
+```
+
+## 5. WHO Critically Important Antimicrobials Categorization
+
+WHO 2019 (6th revision). Reference: https://www.who.int/publications/i/item/9789241515528
+
+Categories: Critically Important (CI), Highly Important (HI), Important (IMP).
+
+```{r who-categorize}
+who_categorize <- function(antibiotic_class, phenotype) {
+  case_when(
+    grepl("Beta-lactam|Amoxicillin|Carbapenem|Cephalosporin",
+          paste(antibiotic_class, phenotype), ignore.case = TRUE) ~
+      "Critically Important",
+    grepl("Aminoglycoside|Tobramycin|Streptomycin|Gentamicin|Amikacin",
+          paste(antibiotic_class, phenotype), ignore.case = TRUE) ~
+      "Critically Important",
+    grepl("Fluoroquinolone|Macrolide|Glycopeptide|Polymyxin",
+          paste(antibiotic_class, phenotype), ignore.case = TRUE) ~
+      "Critically Important",
+    grepl("Trimethoprim|Sulfonamide",
+          paste(antibiotic_class, phenotype), ignore.case = TRUE) ~
+      "Highly Important",
+    grepl("Tetracycline|Phenicol",
+          paste(antibiotic_class, phenotype), ignore.case = TRUE) ~
+      "Highly Important",
+    TRUE ~ "Important"
+  )
+}
+
+resfinder <- resfinder %>%
+  mutate(who_category = who_categorize(antibiotic_class, phenotype),
+         site = factor(site, levels = c("LEWI", "MART", "POSE", "WALK")),
+         year = factor(year, levels = c("2022", "2023")))
+
+cat("\nWHO category breakdown:\n")
+print(resfinder %>% count(who_category, antibiotic_class))
+```
+
+## 6. ARG Count per Sample
+
+```{r arg-counts}
+arg_counts <- resfinder %>%
+  group_by(sample) %>%
+  summarize(n_args = n(),
+            n_genes_unique = n_distinct(resistance_gene),
+            n_classes      = n_distinct(antibiotic_class),
+            n_who_ci       = sum(who_category == "Critically Important"),
+            .groups = "drop") %>%
+  right_join(meta, by = "sample") %>%
+  replace_na(list(n_args = 0, n_genes_unique = 0,
+                  n_classes = 0, n_who_ci = 0))
+
+cat("\nARG count summary by site:\n")
+print(arg_counts %>%
+        group_by(site) %>%
+        summarize(n_samples = n(),
+                  mean_args = round(mean(n_args), 2),
+                  median_args = median(n_args),
+                  zeros = sum(n_args == 0),
+                  .groups = "drop"))
+```
+
+## 7. Statistics: Kruskal-Wallis + Dunn's BH by Site
+
+```{r stats-by-site}
+kw_site <- kruskal.test(n_args ~ site, data = arg_counts)
+print(kw_site)
+
+dunn_site <- arg_counts %>%
+  rstatix::dunn_test(n_args ~ site, p.adjust.method = "BH")
+print(dunn_site)
+```
+
+## 8. Statistics: Kruskal-Wallis + Wilcoxon by Year (Depth-Adjusted)
+
+```{r stats-by-year}
+# Compute ARG count per million filtered reads to control for sequencing depth
+arg_counts <- arg_counts %>%
+  mutate(args_per_million = n_args / (sampleFilteredReadNumber / 1e6))
+
+# Raw count test (for comparison/transparency)
+kw_year_raw    <- kruskal.test(n_args ~ year, data = arg_counts)
+wilcox_year_raw <- wilcox.test(n_args ~ year, data = arg_counts, exact = FALSE)
+
+cat("=== Raw ARG count by year ===\n")
+print(kw_year_raw)
+print(wilcox_year_raw)
+
+# Depth-adjusted test (the one to report)
+kw_year     <- kruskal.test(args_per_million ~ year, data = arg_counts)
+wilcox_year <- wilcox.test(args_per_million ~ year, data = arg_counts,
+                           exact = FALSE)
+
+cat("\n=== Depth-adjusted ARG count (per million reads) by year ===\n")
+print(kw_year)
+print(wilcox_year)
+
+# Compare raw vs adjusted means
+year_summary <- arg_counts %>%
+  group_by(year) %>%
+  summarize(n_samples              = n(),
+            mean_reads_million     = round(mean(sampleFilteredReadNumber) / 1e6, 2),
+            mean_args_raw          = round(mean(n_args), 2),
+            mean_args_per_million  = round(mean(args_per_million), 4),
+            .groups = "drop")
+print(year_summary)
+```
+
+## 9. Panel A: ARG Count by Site (KW + Dunn's BH)
+
+```{r panel-A, fig.width=8, fig.height=6}
+dunn_sig <- dunn_site %>% filter(p.adj < 0.05)
+
+p_count_site <- ggplot(arg_counts, aes(x = site, y = n_args, fill = site)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = year), width = 0.15, size = 2.5, alpha = 0.9) +
+  scale_fill_manual(values = site_colors, name = "Site") +
+  scale_color_manual(values = c("2022" = "#333333", "2023" = "#888888"),
+                     name = "Year") +
+  labs(title    = "A. ARG detections per sample by site",
+       subtitle = sprintf("Kruskal-Wallis: chi-squared = %.2f, df = %d, p = %.4f | brackets = Dunn's BH",
+                          unname(kw_site$statistic),
+                          unname(kw_site$parameter),
+                          kw_site$p.value),
+       caption  = "*** p-adj<0.001, ** p-adj<0.01, * p-adj<0.05",
+       x = "Site",
+       y = "Number of ARG detections per sample") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+if (nrow(dunn_sig) > 0) {
+  dunn_sig <- dunn_sig %>%
+    mutate(stars = case_when(
+      p.adj < 0.001 ~ "***",
+      p.adj < 0.01  ~ "**",
+      p.adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    ))
+  y_top <- max(arg_counts$n_args) + 1
+  y_step <- 1
+  p_count_site <- p_count_site +
+    stat_pvalue_manual(dunn_sig,
+                       label = "stars",
+                       y.position = seq(y_top,
+                                        y_top + y_step * (nrow(dunn_sig) - 1),
+                                        length.out = nrow(dunn_sig)),
+                       tip.length = 0.01,
+                       size = 5)
+}
+
+ggsave(paste0(FIG_DIR, "resfinder_panelA_count_by_site.png"),
+       p_count_site, width = 8, height = 6)
+print(p_count_site)
+```
+
+## 10. Panel B: ARG Detection Rate by Year (Depth-Adjusted)
+
+```{r panel-B, fig.width=7, fig.height=6}
+year_stars <- case_when(
+  wilcox_year$p.value < 0.001 ~ "***",
+  wilcox_year$p.value < 0.01  ~ "**",
+  wilcox_year$p.value < 0.05  ~ "*",
+  TRUE                         ~ "ns"
+)
+p_count_year <- ggplot(arg_counts, aes(x = year, y = args_per_million,
+                                        fill = year)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = site), width = 0.15, size = 2.5, alpha = 0.9) +
+  annotate("segment",
+           x = 1, xend = 2,
+           y = max(arg_counts$args_per_million) * 1.05,
+           yend = max(arg_counts$args_per_million) * 1.05) +
+  annotate("text",
+           x = 1.5,
+           y = max(arg_counts$args_per_million) * 1.10,
+           label = year_stars, size = 6) +
+  scale_fill_manual(values = year_reds, name = "Year") +
+  scale_color_manual(values = site_colors, name = "Site") +
+  labs(title    = "B. ARG detection rate by year (depth-adjusted)",
+       subtitle = sprintf("Wilcoxon rank-sum on depth-adjusted count: W = %.1f, p = %.4f",
+                          unname(wilcox_year$statistic),
+                          wilcox_year$p.value),
+       caption  = paste("Counts normalized to detections per million filtered reads to control for sequencing depth.",
+                        "\n*** p-adj<0.001, ** p-adj<0.01, * p-adj<0.05, ns = not significant"),
+       x = "Year",
+       y = "ARG detections per million filtered reads") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+ggsave(paste0(FIG_DIR, "resfinder_panelB_count_by_year.png"),
+       p_count_year, width = 7, height = 6)
+print(p_count_year)
+```
+
+## 11. Panel C: WHO CIA Categorization Heatmap
+
+Each row is a gene, each column is a sample, fill = detection. Genes ordered by WHO category, then frequency.
+
+```{r panel-C, fig.width=14, fig.height=5}
+gene_who_lookup <- resfinder %>%
+  group_by(resistance_gene) %>%
+  summarize(who_category    = first(who_category),
+            antibiotic_class = first(antibiotic_class),
+            n_detections    = n(),
+            .groups = "drop") %>%
+  arrange(who_category, desc(n_detections))
+
+gene_order <- gene_who_lookup$resistance_gene
+
+heat_df <- meta %>%
+  select(sample, site, year) %>%
+  tidyr::crossing(resistance_gene = gene_order) %>%
+  left_join(resfinder %>%
+              select(sample, resistance_gene, identity, who_category,
+                     antibiotic_class) %>%
+              distinct(sample, resistance_gene, .keep_all = TRUE),
+            by = c("sample", "resistance_gene")) %>%
+  mutate(detected = !is.na(identity),
+         resistance_gene = factor(resistance_gene, levels = gene_order))
+
+sample_order <- meta %>% arrange(site, year) %>% pull(sample)
+heat_df$sample <- factor(heat_df$sample, levels = sample_order)
+
+gene_labels <- setNames(
+  paste0(gene_who_lookup$resistance_gene, " (",
+         substr(gene_who_lookup$who_category, 1, 2), ")"),
+  gene_who_lookup$resistance_gene
+)
+
+p_heat <- ggplot(heat_df,
+                 aes(x = sample, y = resistance_gene, fill = detected)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "grey92"),
+                    labels = c(`TRUE` = "Detected", `FALSE` = "Not detected"),
+                    name = NULL) +
+  scale_y_discrete(labels = gene_labels) +
+  facet_grid(~ site, scales = "free_x", space = "free_x") +
+  labs(title    = "C. Resistance gene detections across samples",
+       subtitle = "Genes annotated by WHO importance: CI = Critically Important, HI = Highly Important",
+       caption  = "WHO 2019, 6th Revision: Critically Important Antimicrobials for Human Medicine",
+       x = NULL,
+       y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(plot.title      = element_text(face = "bold"),
+        plot.subtitle   = element_text(color = "grey40", size = 9),
+        plot.caption    = element_text(color = "grey40", size = 8, hjust = 0),
+        axis.text.x     = element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                       size = 7),
+        axis.text.y     = element_text(size = 9),
+        strip.text      = element_text(face = "bold", size = 10),
+        legend.position = "right")
+
+ggsave(paste0(FIG_DIR, "resfinder_panelC_who_heatmap.png"),
+       p_heat, width = 14, height = 5)
+print(p_heat)
+```
+
+## 12. Panel D: Beta-lactamase / Carbapenemase Callout
+
+```{r panel-D, fig.width=8, fig.height=4}
+beta_lactamases <- c("blaIMP-8", "blaCAM-1")
+beta_hits <- resfinder %>%
+  filter(resistance_gene %in% beta_lactamases) %>%
+  select(sample, resistance_gene, identity, coverage, site, year)
+
+cat("\n=== Beta-lactamase / Carbapenemase detections ===\n")
+print(beta_hits)
+write_csv(beta_hits, paste0(OUTPUT_DIR, "resfinder_beta_lactamase_hits.csv"))
+
+if (nrow(beta_hits) > 0) {
+  p_beta <- ggplot(beta_hits,
+                   aes(x = sample, y = resistance_gene,
+                       fill = identity)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.1f%%", identity)),
+              size = 3, color = "white") +
+    scale_fill_gradient(low = "#FCC5C0", high = "#67000D",
+                        name = "Identity (%)",
+                        limits = c(80, 100)) +
+    facet_grid(. ~ site + year, scales = "free_x", space = "free_x") +
+    labs(title    = "D. Beta-lactamase detections",
+         subtitle = "Two metallo-beta-lactamase variants detected, both in 2023",
+         caption  = "Both genes encode class B metallo-beta-lactamase carbapenemases",
+         x = NULL, y = NULL) +
+    theme_bw(base_size = 11) +
+    theme(plot.title      = element_text(face = "bold"),
+          plot.subtitle   = element_text(color = "grey40", size = 9),
+          plot.caption    = element_text(color = "grey40", size = 8, hjust = 0),
+          axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+          axis.text.y     = element_text(size = 10),
+          strip.text      = element_text(face = "bold", size = 9),
+          legend.position = "right")
+
+  ggsave(paste0(FIG_DIR, "resfinder_panelD_beta_lactamases.png"),
+         p_beta, width = 8, height = 4)
+  print(p_beta)
+}
+```
+
+## 13. Summary Tables
+
+```{r summary-tables}
+gene_summary <- resfinder %>%
+  group_by(resistance_gene, antibiotic_class, who_category) %>%
+  summarize(n_detections   = n(),
+            n_samples      = n_distinct(sample),
+            mean_identity  = round(mean(identity), 2),
+            mean_coverage  = round(mean(coverage), 2),
+            sites          = paste(sort(unique(as.character(site))),
+                                   collapse = ", "),
+            years          = paste(sort(unique(as.character(year))),
+                                   collapse = ", "),
+            .groups = "drop") %>%
+  arrange(who_category, desc(n_detections))
+
+print(gene_summary)
+write_csv(gene_summary, paste0(OUTPUT_DIR, "resfinder_gene_summary_who.csv"))
+
+class_summary <- resfinder %>%
+  count(site, year, antibiotic_class, who_category, name = "n") %>%
+  arrange(site, year, antibiotic_class)
+
+print(class_summary)
+write_csv(class_summary, paste0(OUTPUT_DIR, "resfinder_class_by_site_year.csv"))
+```

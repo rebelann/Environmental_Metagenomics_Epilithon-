@@ -1,0 +1,2262 @@
+---
+title: "ITS taxonomic analysis"
+output: html_document
+date: "2026-05-03"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.width = 8, fig.height = 6)
+```
+
+# Required packages
+
+```{r}
+library(tidyverse)
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(dunn.test)
+library(patchwork)
+library(rstatix)
+library(ggpubr)
+library(car)
+```
+
+# Site colors
+
+```{r}
+site_colors <- c("LEWI" = "#E41A1C", "MART" = "#377EB8",
+                 "POSE" = "#4DAF4A", "WALK" = "#984EA3")
+```
+
+# Load the ITS feature table
+
+```{r}
+otu_raw <- read_tsv("~/Documents/NEON/March_final/ITS_tax/export/feature_table/feature-table.tsv",
+                    skip = 1,
+                    show_col_types = FALSE)
+
+otu_matrix <- otu_raw %>%
+  column_to_rownames("#OTU ID") %>%
+  as.matrix()
+
+OTU <- otu_table(otu_matrix, taxa_are_rows = TRUE)
+```
+
+# Load the ITS taxonomy
+
+```{r}
+taxonomy_raw <- read_tsv("~/Documents/NEON/March_final/ITS_tax/export/taxonomy/taxonomy.tsv",
+                         show_col_types = FALSE)
+
+taxonomy_matrix <- taxonomy_raw %>%
+  separate(Taxon,
+           into = c("Kingdom", "Phylum", "Class", "Order",
+                    "Family", "Genus", "Species"),
+           sep  = ";\\s*",
+           fill = "right") %>%
+  column_to_rownames("Feature ID") %>%
+  select(-Confidence) %>%
+  as.matrix()
+
+TAX <- tax_table(taxonomy_matrix)
+```
+- The warning is ok, it just means some ASVs had more than 7 taxonomy levels in their string, and the extra pieces were discarded. 
+- This is common with UNITE classifications which sometimes include strain or subspecies information beyond Species level. 
+- The 7 standard levels (Kingdom through Species) are all captured correctly.
+
+# Load the ITS metadata
+
+```{r}
+metadata <- read_tsv("~/Documents/NEON/March_final/metadata/amplicon/filtered_metadata_ITS_fixed.tsv",
+                     show_col_types = FALSE) %>%
+  column_to_rownames("sample-id")
+
+SAMP <- sample_data(metadata)
+```
+
+# Fixing the naming conventions
+
+```{r}
+# Check sample names in OTU table
+head(sample_names(OTU))
+
+# Check sample names in metadata
+head(rownames(metadata))
+
+# Check how many match
+sum(sample_names(OTU) %in% rownames(metadata))
+sum(rownames(metadata) %in% sample_names(OTU))
+
+# Fix sample names in OTU table - replace dashes with underscores
+sample_names(OTU) <- gsub("-", "_", sample_names(OTU))
+
+# Verify the fix
+head(sample_names(OTU))
+
+# Check how many match now
+sum(sample_names(OTU) %in% rownames(metadata))
+sum(rownames(metadata) %in% sample_names(OTU))
+```
+
+# Build the phyloseq object
+
+```{r}
+ps <- phyloseq(OTU, TAX, SAMP)
+ps
+```
+
+Check taxonomy strings before filtering
+
+```{r}
+table(tax_table(ps)[, "Kingdom"])
+```
+
+# Filter - keep only Fungi, remove unassigned and NA phylum
+
+```{r}
+ps_filtered <- ps %>%
+  subset_taxa(
+    Kingdom == "k__Fungi" &
+      !is.na(Phylum)
+  )
+
+cat("Before filtering:", ntaxa(ps), "ASVs,", nsamples(ps), "samples\n")
+cat("After filtering: ", ntaxa(ps_filtered), "ASVs,", nsamples(ps_filtered), "samples\n")
+
+retain <- ((ntaxa(ps_filtered)) / (ntaxa(ps))) * 100
+cat("ASVs retained:", round(retain, 2), "%\n")
+```
+
+- All 48,468 ITS ASVs were assigned to the Kingdom Fungi by the UNITE classifier, confirming that the ITS1 amplicon sequencing successfully targeted fungal communities with no off-target amplification of non-fungal sequences. 
+
+- Following removal of ASVs with unresolved phylum-level assignments (which represent sequences that could not be confidently placed within the fungal taxonomy and would add noise without biological interpretability), 32,627 ASVs were retained (67.32% of original ASVs) across all 178 samples. All 178 samples were retained after filtering.
+
+
+# Verify only Fungi remain
+
+```{r}
+table(tax_table(ps_filtered)[, "Kingdom"])
+```
+
+# Save filtered phyloseq object
+
+```{r}
+saveRDS(ps_filtered, "~/Documents/NEON/March_final/ITS_tax/phyloseq_ITS_filtered.rds")
+saveRDS(ps, "~/Documents/NEON/March_final/ITS_tax/phyloseq_ITS_unfiltered.rds")
+cat("Phyloseq objects saved!\n")
+```
+
+## Make the unclassified table
+
+```{r}
+library(tidyverse)
+
+# Load both versions
+ps <- readRDS("~/Documents/NEON/March_final/ITS_tax/phyloseq_ITS_unfiltered.rds")
+ps_filtered <- readRDS("~/Documents/NEON/March_final/ITS_tax/phyloseq_ITS_filtered.rds")
+
+# Get removed ASVs
+removed_asvs <- setdiff(taxa_names(ps), taxa_names(ps_filtered))
+removed_tax <- as.data.frame(tax_table(ps))[removed_asvs, ]
+
+# Count by reason
+n_non_fungi <- sum(removed_tax$Kingdom != "k__Fungi", na.rm = TRUE)
+n_no_phylum <- sum(is.na(removed_tax$Phylum), na.rm = TRUE)
+
+# Build the table
+filter_table_ITS <- tibble(
+  Category = c("Total ASVs (pre-filter)",
+               "Non-Fungi",
+               "NA phylum",
+               "Total removed",
+               "Retained ASVs"),
+  Count = c(ntaxa(ps),
+            n_non_fungi,
+            n_no_phylum,
+            length(removed_asvs),
+            ntaxa(ps_filtered))
+)
+
+print(filter_table_ITS)
+write_tsv(filter_table_ITS, "~/Documents/NEON/March_final/ITS_tax/ITS_filtering_table.tsv")
+```
+
+## Sample read depth
+
+```{r}
+depth <- sample_sums(ps_filtered)
+summary(depth)
+```
+
+- Minimum: 4,932 reads - this is the sample to watch
+- Median: 190,542 reads - excellent depth
+- Mean: 187,722 reads - very close to median, symmetric distribution
+- Maximum: 638,567 reads
+- The minimum at 4,932 is quite low compared to the rest. 
+
+How many samples fall below common rarefaction thresholds?
+
+```{r}
+sum(depth < 1000)
+sum(depth < 2000)
+sum(depth < 5000)
+sum(depth < 10000)
+sum(depth < 20000)
+```
+
+## 10 samples with lowest read depth
+
+```{r}
+low_depth <- sort(depth)[1:10]
+
+low_depth_info <- data.frame(
+  sample_id = names(low_depth),
+  read_depth = as.numeric(low_depth)
+) %>%
+  left_join(
+    metadata %>% rownames_to_column("sample_id") %>%
+      select(sample_id, site, year, season),
+    by = "sample_id"
+  ) %>%
+  arrange(read_depth)
+
+print(low_depth_info)
+```
+- All 10 of the lowest read depth samples are from WALK
+
+##Investigating the full depth summary
+
+```{r}
+summary(depth)
+```
+
+
+## Check read depth by site
+
+```{r}
+data.frame(depth = depth) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(metadata %>% rownames_to_column("sample_id") %>% select(sample_id, site),
+            by = "sample_id") %>%
+  group_by(site) %>%
+  summarise(min = min(depth),
+            median = median(depth),
+            mean = mean(depth),
+            max = max(depth))
+```
+
+
+## Read depth histogram
+
+```{r}
+data.frame(depth = depth) %>%
+  ggplot(aes(x = depth)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = median(depth), color = "red", linetype = "dashed") +
+  labs(x = "Read Depth", y = "Number of Samples",
+       title = "ITS Sample Read Depth Distribution",
+       subtitle = paste("Red dashed line = median:", median(depth))) +
+  theme_bw()
+```
+
+## Read depth bar plot
+
+```{r}
+depth_df <- data.frame(
+  sample_id = names(depth),
+  depth     = as.numeric(depth)
+)
+
+ggplot(depth_df, aes(x = reorder(sample_id, depth), y = depth)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+  labs(title = "ITS sample read depth after filtering",
+       x = "Sample", y = "Read depth") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+
+How many WALK samples per site-season-year cell would be lost at each threshold
+
+```{r}
+sample_data(ps_filtered) %>%
+  data.frame() %>%
+  rownames_to_column("sample_id") %>%
+  mutate(depth = sample_sums(ps_filtered)[sample_id]) %>%
+  group_by(site, year, season) %>%
+  summarise(n = n(),
+            n_below_5k = sum(depth < 5000),
+            n_below_10k = sum(depth < 10000),
+            .groups = "drop") %>%
+  filter(site == "WALK") %>%
+  arrange(year, season)
+```
+
+## Rarefaction curves
+
+```{r}
+otu_mat <- as(otu_table(ps_filtered), "matrix") %>% t()
+
+png("rarefaction_ITS_4900.png",
+    width  = 8,
+    height = 5,
+    units  = "in",
+    res    = 300)
+
+rarecurve(otu_mat,
+          step  = 1000,
+          col   = "steelblue",
+          lwd   = 0.5,
+          label = FALSE,
+          xlim  = c(0, 50000),
+          xlab  = "Reads sampled",
+          ylab  = "ASV richness",
+          main  = "ITS Rarefaction curves - all samples")
+abline(v = 4900, col = "red", lty = 2, lwd = 1.5)
+
+dev.off()
+```
+
+## Observed richness summary
+
+```{r}
+obs_richness <- estimate_richness(ps_filtered, measures = "Observed")
+summary(obs_richness)
+```
+
+# Rarefaction
+
+- Rationale for rarefaction depth of 4,900
+  + This keeps all 178 samples, every WALK cell intact at its current n, and matches the 16S logic.
+  + For 16S I picked 65,000 just below the new min of 65,303 after dropping the outlier. 
+  + For ITS, the equivalent move is 4,900 just below 4,932, without dropping any samples because the low depth is biological (lower fungal biomass at WALK), not a technical outlier.
+  + We dropped samples only when an isolated technical outlier could be removed for clear methodological gain. In 16S that applied to one sample. In ITS no sample met that criterion, so all 178 were retained.
+
+```{r}
+# Rarefy at 4,900
+set.seed(123)
+ps_rarefied <- rarefy_even_depth(ps_filtered,
+                                  sample.size = 4900,
+                                  rngseed = 123,
+                                  replace = FALSE)
+
+# Compare richness before and after
+obs_before <- estimate_richness(ps_filtered, measures = "Observed")
+obs_after  <- estimate_richness(ps_rarefied, measures = "Observed")
+
+cat("Before rarefaction - median richness:", median(obs_before$Observed), "\n")
+cat("After rarefaction  - median richness:", median(obs_after$Observed), "\n")
+cat("Richness retained:", round(median(obs_after$Observed)/median(obs_before$Observed)*100, 1), "%\n")
+cat("Samples retained:", nsamples(ps_rarefied), "\n")
+cat("ASVs retained:", ntaxa(ps_rarefied), "\n")
+```
+All 178 samples were rarefied to 4,900 reads per sample (set.seed(123)),
+the depth chosen as just below the minimum sample read count (4,932) to
+retain the full sample set. This depth selection reflects a trade-off
+specific to ITS amplicon data, where the WALK site exhibited
+consistently lower read depths (median 55,617 reads) compared to LEWI,
+MART, and POSE (medians 190,365–239,673 reads). Because this pattern
+was site-wide rather than driven by isolated technical outliers, it
+likely reflects lower fungal biomass at WALK rather than sequencing
+failure, and removing low-depth WALK samples would have introduced bias
+against that site. Rarefaction at 4,900 reads retained 178 samples and
+20,537 ASVs (63% of fungal ASVs), with 63.5% median observed richness
+retained. Shannon diversity and Bray-Curtis dissimilarity, the primary
+metrics for downstream analysis, are robust at this depth as both are
+weighted toward abundant taxa.
+
+```{r}
+# Save the rarefied object
+saveRDS(ps_rarefied, "~/Documents/NEON/March_final/ITS_tax/phyloseq_ITS_rarefied.rds")
+cat("Saved!\n")
+```
+
+# Alpha diversity (Shannon)
+
+```{r}
+alpha_div <- estimate_richness(ps_rarefied, measures = "Shannon")
+
+# Add metadata
+alpha_div$sample_id <- rownames(alpha_div)
+metadata_df <- as(sample_data(ps_rarefied), "data.frame")
+metadata_df$sample_id <- rownames(metadata_df)
+
+alpha_df <- left_join(alpha_div, metadata_df, by = "sample_id")
+
+# Quick look at Shannon distribution
+summary(alpha_df$Shannon)
+```
+
+Check whether the join worked
+
+```{r}
+sum(is.na(alpha_df$site))
+```
+
+- Range: 0.56 → 6.02 - wide range, normal for environmental ITS data
+- Median 3.60, Mean 3.61 - very close, suggesting roughly symmetric distribution
+- ITS being lower is expected because fungal communities have fewer total ASVs per sample (~460 vs ~2,680 for 16S), so even at maximum evenness Shannon caps lower
+- The 0.56 minimum is worth keeping an eye on, that's a sample dominated by very few fungal ASVs.
+
+## Set factor levels
+
+```{r}
+alpha_df <- alpha_df %>%
+  mutate(
+    site   = factor(site, levels = c("LEWI", "MART", "POSE", "WALK")),
+    season = factor(season, levels = c("Spring", "Summer", "Fall")),
+    year   = factor(year, levels = c("2021", "2022", "2023"))
+  )
+
+# Sample counts by group
+table(alpha_df$site)
+table(alpha_df$season)
+table(alpha_df$year)
+```
+# Assumption checks
+
+## Shapiro-Wilk normality test 
+
+```{r}
+shapiro.test(alpha_df$Shannon)
+```
+
+## Visual normality check
+
+```{r}
+par(mfrow = c(1, 2))
+hist(alpha_df$Shannon, main = "Shannon distribution", xlab = "Shannon")
+qqnorm(alpha_df$Shannon, main = "Shannon Q-Q plot")
+qqline(alpha_df$Shannon)
+```
+
+# Levene's tests for homogeneity of variance
+
+```{r}
+cat("\n=== Levene's: Shannon ~ site ===\n")
+leveneTest(Shannon ~ site, data = alpha_df)
+
+cat("\n=== Levene's: Shannon ~ season ===\n")
+leveneTest(Shannon ~ season, data = alpha_df)
+
+cat("\n=== Levene's: Shannon ~ year ===\n")
+leveneTest(Shannon ~ year, data = alpha_df)
+```
+- Shannon diversity was non-normally distributed (Shapiro-Wilk: W = 0.984, p = 0.034), supporting the use of nonparametric tests.
+- Levene's tests showed equal variances across sites (F = 0.91, p = 0.44) and years (F = 1.43, p = 0.24).
+- Levene's test showed unequal variances across seasons (F = 7.01, p = 0.001).
+- Kruskal-Wallis remains appropriate for all three comparisons; the seasonal result is interpreted as a test of distributional differences rather than strictly median differences.
+- Dunn's test with BH correction was used for post-hoc pairwise comparisons.
+
+# Kruskal-Wallis + Dunn's for Shannon
+
+## Kruskal-Wallis: Shannon ~ site 
+
+H0: Fungal Shannon diversity does not differ across sites
+
+HA: Fungal Shannon diversity differs in at least one site
+
+```{r}
+cat(" Shannon ~ Site: \n")
+kruskal.test(Shannon ~ site, data = alpha_df)
+```
+
+- Shannon diversity differed significantly across sites (Kruskal-Wallis: χ² = 20.534, df = 3, p = 1.32e-04).
+- Reject H0 - fungal Shannon diversity differs in at least one site.
+
+### Dunn's post-hoc test (BH): Shannon ~ site
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two sites
+
+HA (per pair): Fungal Shannon diversity differs between the two sites
+
+```{r}
+dunn_test(alpha_df, Shannon ~ site, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+```
+
+- Dunn's post-hoc test with BH correction was used for pairwise comparisons.
+- MART had significantly higher fungal Shannon diversity than LEWI (Z = 2.82, p = 0.014).
+- MART had significantly higher fungal Shannon diversity than POSE (Z = −4.13, p < 0.001).
+- MART had significantly higher fungal Shannon diversity than WALK (Z = −2.82, p = 0.015).
+- LEWI, POSE, and WALK did not differ significantly from each other (all p > 0.8).
+- This site-level pattern contrasts with the 16S results, where WALK had bacterial diversity comparable to MART.
+- Lower fungal diversity at WALK is consistent with the site-wide lower ITS read depths observed (median 55,617 reads vs. 190,365–239,673 at other sites), suggesting reduced fungal biomass at this site.
+
+## Shannon boxplot by site
+
+```{r}
+dunn_site <- dunn_test(alpha_df, Shannon ~ site, p.adjust.method = "BH") %>%
+  add_xy_position(x = "site") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                              formatC(p.adj, format = "g", digits = 3)))
+
+dunn_site_sig <- dunn_site %>% filter(p.adj < 0.05)
+
+p_site <- ggplot(alpha_df, aes(x = site, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_site_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, name = "Site") +
+  labs(title    = "Shannon diversity by site",
+       subtitle = "Kruskal-Wallis χ² = 20.534, df = 3, p = 1.32e-04",
+       caption  = "Dunn's post-hoc with BH correction. Non-significant pairs: LEWI vs POSE (p = 1.000), LEWI vs WALK (p = 1.000), POSE vs WALK (p = 0.825)",
+       x        = "Site",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_site
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_site.png",
+       p_site, width = 8, height = 6, dpi = 300)
+```
+
+## Kruskal-Wallis: Shannon ~ season
+
+H0: Fungal Shannon diversity does not differ across seasons
+
+HA: Fungal Shannon diversity differs in at least one season
+
+```{r}
+cat("\n Shannon ~ Season: \n")
+kruskal.test(Shannon ~ season, data = alpha_df)
+```
+- Shannon diversity differed significantly across seasons (Kruskal-Wallis: χ² = 11.857, df = 2, p = 0.0027).
+- Reject H0 - fungal Shannon diversity differs in at least one season.
+- Note: Levene's test indicated unequal variances across seasons (F = 7.01, p = 0.001), so this Kruskal-Wallis result is interpreted as a test of distributional differences rather than strictly median differences.
+
+### Dunn's post-hoc test (BH): Shannon ~ season
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two seasons
+
+HA (per pair): Fungal Shannon diversity differs between the two seasons
+
+```{r}
+dunn_test(alpha_df, Shannon ~ season, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+```
+
+- Dunn's post-hoc test with BH correction was used for pairwise comparisons.
+- Spring had significantly higher fungal Shannon diversity than Fall (Z = 3.44, p = 0.0009).
+- Spring vs Summer was not significant (Z = −1.82, p = 0.104), though there is a trend toward Spring being higher.
+- Summer vs Fall was not significant (Z = 1.62, p = 0.159).
+- The dominant seasonal signal is Spring > Fall, with Summer falling between the two and not significantly different from either.
+- Worth comparing to 16S in discussion: ITS shows a Spring-Fall contrast for fungi, which may differ from the seasonal pattern observed for bacteria.
+
+## Kruskal-Wallis: Shannon ~ year
+
+H0: Fungal Shannon diversity does not differ across years
+
+HA: Fungal Shannon diversity differs in at least one year
+
+```{r}
+cat("\n Shannon ~ Year: \n")
+kruskal.test(Shannon ~ year, data = alpha_df)
+```
+
+### Dunn's post-hoc test (BH): Shannon ~ year
+
+```{r}
+dunn_test(alpha_df, Shannon ~ year, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+```
+
+- Dunn's post-hoc test with BH correction was used for pairwise comparisons.
+- 2021 vs 2022: significant - 2022 had higher fungal Shannon diversity than 2021 (Z = −3.28, p = 0.0015).
+- 2021 vs 2023: significant - 2023 had higher fungal Shannon diversity than 2021 (Z = −4.85, p < 0.0001).
+- 2022 vs 2023 was not significant (Z = −1.58, p = 0.172).
+- Pattern: 2021 < 2022 ≈ 2023. Fungal diversity was lower in 2021 and increased to a higher steady level in 2022–2023.
+- Worth noting in your discussion: this temporal increase in fungal diversity contrasts with whatever pattern your 16S year analysis showed, and could reflect interannual environmental variation (drought, flow regime, temperature) accumulating effects on the slower-turnover fungal community.
+
+# LEWI: Shannon ~ season
+
+## LEWI Kruskal-wallis Shannon ~ Season
+
+H0: Fungal Shannon diversity does not differ across seasons within the LEWI site
+
+HA: Fungal Shannon diversity differs in at least one season within the LEWI site
+
+```{r}
+df_LEWI <- alpha_df %>% filter(site == "LEWI")
+
+cat("Shannon ~ Season within LEWI:\n")
+kruskal.test(Shannon ~ season, data = df_LEWI)
+```
+## Dunn's: LEWI Shannon ~ season
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two seasons within LEWI
+
+HA (per pair): Fungal Shannon diversity differs between the two seasons within LEWI
+
+```{r}
+dunn_test(df_LEWI, Shannon ~ season, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+```
+
+
+- Dunn's post-hoc test with BH correction was used for pairwise comparisons.
+- Spring vs Summer: significant - Spring had higher fungal Shannon diversity than Summer (Z = −2.55, p = 0.032).
+- Spring vs Fall: not significant (Z = 1.13, p = 0.773).
+- Summer vs Fall: not significant (Z = −1.30, p = 0.580).
+- LEWI shows a single significant pairwise contrast: Spring > Summer.
+- Note: LEWI has the smallest sample size (n=24, ~7–9 samples per season), which limits statistical power to detect smaller seasonal differences.
+
+## LEWI Shannon ~ Season boxplot
+
+```{r}
+dunn_LEWI_season <- dunn_test(df_LEWI, Shannon ~ season,
+                               p.adjust.method = "BH") %>%
+  add_xy_position(x = "season") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+
+# Filter to significant pairs only - drops non-significant brackets
+dunn_LEWI_season_sig <- dunn_LEWI_season %>% filter(p.adj < 0.05)
+
+p_LEWI_season <- ggplot(df_LEWI, aes(x = season, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_LEWI_season_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("Spring", "Summer", "Fall")) +
+  labs(title    = "LEWI - Shannon diversity by season",
+       subtitle = "Kruskal-Wallis χ² = 6.55, df = 2, p = 0.038",
+       caption  = "Bracket p-values are from Dunn's post-hoc test with BH correction. Non-significant pairs (p ≥ 0.05) are not shown.",
+       x        = "Season",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_LEWI_season
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_LEWI_season.png",
+       p_LEWI_season, width = 8, height = 6, dpi = 300)
+```
+
+# LEWI Shannon ~ year
+
+## LEWI Kruskal-wallis Shannon ~ year
+
+H0: Fungal Shannon diversity does not differ across years within the LEWI site
+
+HA: Fungal Shannon diversity differs in at least one year within the LEWI site
+
+```{r}
+cat("\n LEWI: Shannon ~ Year: \n")
+kruskal.test(Shannon ~ year, data = df_LEWI)
+```
+
+## Dunn's: LEWI Shannon ~ year
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two years within LEWI
+
+HA (per pair): Fungal Shannon diversity differs between the two years within LEWI
+
+```{r}
+cat("\n Dunn's: LEWI Shannon ~ year: \n")
+
+dunn_test(df_LEWI, Shannon ~ year, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+
+```
+- Dunn's post-hoc test with BH correction was used for pairwise comparisons.
+- 2021 vs 2022: significant - 2022 had higher fungal Shannon diversity than 2021 (Z = −2.75, p = 0.018).
+- 2021 vs 2023: not significant (Z = −1.83, p = 0.200).
+- 2022 vs 2023: not significant (Z = 0.77, p = 1.000).
+- LEWI shows a single significant pairwise contrast: 2022 > 2021.
+- This mirrors the overall ITS year pattern (2021 < 2022 ≈ 2023), with 2022 specifically showing the significant lift over 2021 within this site.
+- Note: LEWI's small sample size (n=24, ~7–9 per year) limits power to detect smaller annual differences.
+
+## LEWI Shannon ~ year plot
+
+```{r}
+dunn_LEWI_year <- dunn_test(df_LEWI, Shannon ~ year,
+                             p.adjust.method = "BH") %>%
+  add_xy_position(x = "year") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+
+dunn_LEWI_year_sig <- dunn_LEWI_year %>% filter(p.adj < 0.05)
+
+p_LEWI_year <- ggplot(df_LEWI, aes(x = year, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_LEWI_year_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("2021", "2022", "2023")) +
+  labs(title    = "LEWI - Shannon diversity by year",
+       subtitle = "Kruskal-Wallis χ² = 7.85, df = 2, p = 0.020",
+       caption  = "Bracket p-values are from Dunn's post-hoc test with BH correction. Non-significant pairs (p ≥ 0.05) are not shown.",
+       x        = "Year",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_LEWI_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_LEWI_year.png",
+       p_LEWI_year, width = 8, height = 6, dpi = 300)
+```
+
+# MART Shannon ~ Season
+
+## MART Kruskal-wallis Shannon ~ season
+
+H0: Fungal Shannon diversity does not differ across seasons within the MART site
+HA: Fungal Shannon diversity differs in at least one season within the MART site
+
+```{r}
+df_MART <- alpha_df %>% filter(site == "MART")
+
+cat("\n MART: Shannon ~ Season: \n")
+kruskal.test(Shannon ~ season, data = df_MART)
+```
+### Dunn's: MART Shannon ~ season
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two seasons within MART
+HA (per pair): Fungal Shannon diversity differs between the two seasons within MART
+
+```{r}
+cat("\n Dunn's: MART Shannon ~ season: \n")
+
+dunn_test(df_MART, Shannon ~ season, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+```
+- Within MART, Shannon diversity differed significantly across seasons (Kruskal-Wallis: χ² = 10.424, df = 2, p = 0.0054).
+- Reject H0 - fungal Shannon diversity differs in at least one season within MART.
+
+## MART Shannon ~ season plot
+
+```{r}
+dunn_MART_season <- dunn_test(df_MART, Shannon ~ season,
+                               p.adjust.method = "BH") %>%
+  add_xy_position(x = "season") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+
+dunn_MART_season_sig <- dunn_MART_season %>% filter(p.adj < 0.05)
+
+p_MART_season <- ggplot(df_MART, aes(x = season, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_MART_season_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("Spring", "Summer", "Fall")) +
+  labs(title    = "MART - Shannon diversity by season",
+       subtitle = "Kruskal-Wallis χ² = 10.42, df = 2, p = 0.0054",
+       caption  = "Bracket p-values are from Dunn's post-hoc test with BH correction. Non-significant pairs (p ≥ 0.05) are not shown.",
+       x        = "Season",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_MART_season
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_MART_season.png",
+       p_MART_season, width = 8, height = 6, dpi = 300)
+```
+
+# MART Shannon ~ year
+
+## MART Kruskal-wallis Shannon ~ year
+
+H0: Fungal Shannon diversity does not differ across years within the MART site
+HA: Fungal Shannon diversity differs in at least one year within the MART site
+
+```{r}
+cat("\n MART: Shannon ~ Year: \n")
+kruskal.test(Shannon ~ year, data = df_MART)
+```
+### Dunn's: MART Shannon ~ year
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two years within MART
+HA (per pair): Fungal Shannon diversity differs between the two years within MART
+
+```{r}
+cat("\n Dunn's: MART Shannon ~ year: \n")
+
+dunn_test(df_MART, Shannon ~ year, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+
+```
+- Dunn's post-hoc test with BH correction was used for pairwise comparisons.
+- 2021 vs 2022: not significant (Z = −1.43, p = 0.455).
+- 2021 vs 2023: significant - 2023 had higher fungal Shannon diversity than 2021 (Z = −3.89, p = 0.0003).
+- 2022 vs 2023: significant - 2023 had higher fungal Shannon diversity than 2022 (Z = −2.42, p = 0.0461).
+- MART shows two significant pairwise contrasts: 2023 > 2021 and 2023 > 2022.
+- Pattern at MART: fungal Shannon diversity rose meaningfully in 2023 relative to both prior years - a different annual pattern than LEWI (which had 2022 > 2021 only)
+
+## MART Shannon ~ year plot
+
+```{r}
+dunn_MART_year <- dunn_test(df_MART, Shannon ~ year,
+                             p.adjust.method = "BH") %>%
+  add_xy_position(x = "year") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+
+dunn_MART_year_sig <- dunn_MART_year %>% filter(p.adj < 0.05)
+
+p_MART_year <- ggplot(df_MART, aes(x = year, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_MART_year_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("2021", "2022", "2023")) +
+  labs(title    = "MART - Shannon diversity by year",
+       subtitle = "Kruskal-Wallis χ² = 15.53, df = 2, p = 0.0004",
+       caption  = "Bracket p-values are from Dunn's post-hoc test with BH correction. Non-significant pairs (p ≥ 0.05) are not shown.",
+       x        = "Year",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_MART_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_MART_year.png",
+       p_MART_year, width = 8, height = 6, dpi = 300)
+```
+
+# POSE Shannon ~ season
+
+## POSE Kruskal-wallis Shannon ~ season
+
+H0: Fungal Shannon diversity does not differ across seasons within the POSE site
+HA: Fungal Shannon diversity differs in at least one season within the POSE site
+
+```{r}
+df_POSE <- alpha_df %>% filter(site == "POSE")
+
+cat("\n POSE: Shannon ~ Season: \n")
+kruskal.test(Shannon ~ season, data = df_POSE)
+```
+### Dunn's: POSE Shannon ~ season
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two seasons within POSE
+HA (per pair): Fungal Shannon diversity differs between the two seasons within POSE
+
+```{r}
+cat("\n Dunn's: POSE Shannon ~ season: \n")
+
+dunn_test(df_POSE, Shannon ~ season, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+
+```
+- Dunn's post-hoc test with BH correction was used for pairwise comparisons.
+- Spring vs Fall: significant - Spring had higher fungal Shannon diversity than Fall (Z = 2.85, p = 0.0131).
+- Summer vs Fall: not significant (Z = 0.03, p = 1.000).
+- Spring vs Summer: significant - Spring had higher fungal Shannon diversity than Summer (Z = −2.82, p = 0.0143).
+- POSE shows two significant pairwise contrasts: Spring > Fall and Spring > Summer.
+- Pattern at POSE: Spring is notably higher than both Summer and Fall, while Summer and Fall are statistically indistinguishable.
+- This is a different seasonal pattern than MART (Fall > Summer) - POSE's fungal diversity peaks in Spring.
+
+
+## POSE Shannon ~ season plot
+
+```{r}
+dunn_POSE_season <- dunn_test(df_POSE, Shannon ~ season,
+                               p.adjust.method = "BH") %>%
+  add_xy_position(x = "season") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+
+dunn_POSE_season_sig <- dunn_POSE_season %>% filter(p.adj < 0.05)
+
+p_POSE_season <- ggplot(df_POSE, aes(x = season, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_POSE_season_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("Spring", "Summer", "Fall")) +
+  labs(title    = "POSE - Shannon diversity by season",
+       subtitle = "Kruskal-Wallis χ² = 10.72, df = 2, p = 0.0047",
+       caption  = "Bracket p-values are from Dunn's post-hoc test with BH correction. Non-significant pairs (p ≥ 0.05) are not shown.",
+       x        = "Season",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_POSE_season
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_POSE_season.png",
+       p_POSE_season, width = 8, height = 6, dpi = 300)
+```
+
+# POSE Shannon ~ year 
+
+## POSE Kruskal-wallis Shannon ~ year
+
+H0: Fungal Shannon diversity does not differ across years within the POSE site
+
+HA: Fungal Shannon diversity differs in at least one year within the POSE site
+
+```{r}
+cat("\n POSE: Shannon ~ Year: \n")
+kruskal.test(Shannon ~ year, data = df_POSE)
+```
+### Dunn's: POSE Shannon ~ year
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two years within POSE
+HA (per pair): Fungal Shannon diversity differs between the two years within POSE
+
+```{r}
+cat("\n Dunn's: POSE Shannon ~ year: \n")
+
+dunn_test(df_POSE, Shannon ~ year, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+
+```
+- Although the Kruskal-Wallis test was non-significant, Dunn's pairwise comparisons were run for completeness.
+- 2021 vs 2022: not significant (Z = −0.82, p = 1.000).
+- 2021 vs 2023: not significant (Z = −2.14, p = 0.097) - borderline trend, 2023 directionally higher than 2021.
+- 2022 vs 2023: not significant (Z = −1.32, p = 0.560).
+- POSE shows no significant pairwise contrasts across years.
+- POSE is the first site where year is NOT a significant driver of fungal diversity (LEWI year p = 0.020; MART year p = 0.0004; POSE year p = 0.097).
+- Biological note: while LEWI and MART showed temporal increases in fungal diversity (consistent with the overall ITS pattern of 2021 < 2022 ≈ 2023), POSE did not - its fungal community was relatively stable across the 3-year period.
+
+
+## POSE Shannon ~ year plot
+
+```{r}
+dunn_POSE_year <- dunn_test(df_POSE, Shannon ~ year,
+                             p.adjust.method = "BH") %>%
+  add_xy_position(x = "year") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+
+dunn_POSE_year_sig <- dunn_POSE_year %>% filter(p.adj < 0.05)
+
+p_POSE_year <- ggplot(df_POSE, aes(x = year, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_POSE_year_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("2021", "2022", "2023")) +
+  labs(title    = "POSE - Shannon diversity by year",
+       subtitle = "Kruskal-Wallis χ² = 4.67, df = 2, p = 0.097 (not significant)",
+       caption  = "Bracket p-values are from Dunn's post-hoc test with BH correction. No pairwise comparisons were significant at α = 0.05.",
+       x        = "Year",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_POSE_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_POSE_year.png",
+       p_POSE_year, width = 8, height = 6, dpi = 300)
+```
+
+# WALK Shannon ~ season
+
+## WALK Kruskal-wallis Shannon ~ season
+
+H0: Fungal Shannon diversity does not differ across seasons within the WALK site
+HA: Fungal Shannon diversity differs in at least one season within the WALK site
+
+```{r}
+df_WALK <- alpha_df %>% filter(site == "WALK")
+
+cat("\n WALK: Shannon ~ Season: \n")
+kruskal.test(Shannon ~ season, data = df_WALK)
+```
+### Dunn's: WALK Shannon ~ season
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two seasons within WALK
+HA (per pair): Fungal Shannon diversity differs between the two seasons within WALK
+
+```{r}
+cat("\n Dunn's: WALK Shannon ~ season: \n")
+
+dunn_test(df_WALK, Shannon ~ season, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+
+```
+- Although the Kruskal-Wallis test was non-significant, Dunn's pairwise comparisons were run for completeness.
+- Spring vs Fall: not significant (Z = 0.66, p = 1.000).
+- Spring vs Summer: not significant (Z = −0.59, p = 1.000).
+- Summer vs Fall: not significant (Z = 0.05, p = 1.000).
+- WALK shows no significant pairwise contrasts across seasons - Dunn's results are fully consistent with the non-significant Kruskal-Wallis result.
+- Among all four sites, WALK has the flattest fungal seasonal pattern. LEWI, MART, and POSE all showed at least one significant seasonal contrast, but WALK shows none.
+
+```{r}
+dunn_WALK_season <- dunn_test(df_WALK, Shannon ~ season,
+                               p.adjust.method = "BH") %>%
+  add_xy_position(x = "season") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+
+dunn_WALK_season_sig <- dunn_WALK_season %>% filter(p.adj < 0.05)
+
+p_WALK_season <- ggplot(df_WALK, aes(x = season, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_WALK_season_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("Spring", "Summer", "Fall")) +
+  labs(title    = "WALK - Shannon diversity by season",
+       subtitle = "Kruskal-Wallis χ² = 0.54, df = 2, p = 0.765 (not significant)",
+       caption  = "Bracket p-values are from Dunn's post-hoc test with BH correction. No pairwise comparisons were significant at α = 0.05.",
+       x        = "Season",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_WALK_season
+
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_WALK_season.png",
+       p_WALK_season, width = 8, height = 6, dpi = 300)
+```
+
+# WALK Shannon ~ year
+
+## WALK Kruskal-wallis Shannon ~ year
+
+H0: Fungal Shannon diversity does not differ across years within the WALK site
+HA: Fungal Shannon diversity differs in at least one year within the WALK site
+
+```{r}
+cat("\n WALK: Shannon ~ Year: \n")
+kruskal.test(Shannon ~ year, data = df_WALK)
+```
+
+### Dunn's: WALK Shannon ~ year
+
+H0 (per pair): Fungal Shannon diversity does not differ between the two years within WALK
+HA (per pair): Fungal Shannon diversity differs between the two years within WALK
+
+```{r}
+cat("\n Dunn's: WALK Shannon ~ year: \n")
+
+dunn_test(df_WALK, Shannon ~ year, p.adjust.method = "BH") %>%
+  select(group1, group2, statistic, p, p.adj, p.adj.signif) %>%
+  print()
+```
+
+
+## WALK Shannon ~ year plot
+
+```{r}
+dunn_WALK_year <- dunn_test(df_WALK, Shannon ~ year,
+                             p.adjust.method = "BH") %>%
+  add_xy_position(x = "year") %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+
+dunn_WALK_year_sig <- dunn_WALK_year %>% filter(p.adj < 0.05)
+
+p_WALK_year <- ggplot(df_WALK, aes(x = year, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_WALK_year_sig,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("2021", "2022", "2023")) +
+  labs(title    = "WALK - Shannon diversity by year",
+       subtitle = "Kruskal-Wallis χ² = 6.93, df = 2, p = 0.031",
+       caption  = "Bracket p-values are from Dunn's post-hoc test with BH correction. Non-significant pairs (p ≥ 0.05) are not shown.",
+       x        = "Year",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0))
+
+p_WALK_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_WALK_year.png",
+       p_WALK_year, width = 8, height = 6, dpi = 300)
+```
+
+### Combined Dunn's brackets across all 4 sites for season
+```{r}
+dunn_LEWI_s <- dunn_test(df_LEWI, Shannon ~ season, p.adjust.method = "BH") %>%
+  add_xy_position(x = "season") %>% filter(p.adj < 0.05) %>% mutate(site = "LEWI")
+
+dunn_MART_s <- dunn_test(df_MART, Shannon ~ season, p.adjust.method = "BH") %>%
+  add_xy_position(x = "season") %>% filter(p.adj < 0.05) %>% mutate(site = "MART")
+
+dunn_POSE_s <- dunn_test(df_POSE, Shannon ~ season, p.adjust.method = "BH") %>%
+  add_xy_position(x = "season") %>% filter(p.adj < 0.05) %>% mutate(site = "POSE")
+
+# WALK - nothing significant, skip
+
+dunn_all_season <- bind_rows(dunn_LEWI_s, dunn_MART_s, dunn_POSE_s) %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+```
+
+
+# Combined season boxplots
+```{r}
+p_combined_season <- ggplot(alpha_df, aes(x = season, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_all_season,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("Spring", "Summer", "Fall")) +
+  facet_wrap(~ site, nrow = 1) +
+  labs(title    = "Fungal Shannon diversity by season across sites",
+       subtitle = "Kruskal-Wallis per site; Dunn's post-hoc with BH correction",
+       caption  = "Brackets show significant pairwise comparisons (p < 0.05). WALK: no significant seasonal differences.",
+       x        = "Season",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title       = element_text(face = "bold"),
+        plot.subtitle    = element_text(color = "grey40", size = 9),
+        plot.caption     = element_text(color = "grey40", size = 8, hjust = 0),
+        strip.text       = element_text(face = "bold", size = 11),
+        strip.background = element_rect(fill = "grey92"))
+
+p_combined_season
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_combined_season.png",
+       p_combined_season, width = 12, height = 6, dpi = 300)
+```
+
+### Combined Dunn's brackets across all 4 sites for year 
+```{r}
+dunn_LEWI_y <- dunn_test(df_LEWI, Shannon ~ year, p.adjust.method = "BH") %>%
+  add_xy_position(x = "year") %>% filter(p.adj < 0.05) %>% mutate(site = "LEWI")
+
+dunn_MART_y <- dunn_test(df_MART, Shannon ~ year, p.adjust.method = "BH") %>%
+  add_xy_position(x = "year") %>% filter(p.adj < 0.05) %>% mutate(site = "MART")
+
+# POSE - nothing significant, skip
+
+dunn_WALK_y <- dunn_test(df_WALK, Shannon ~ year, p.adjust.method = "BH") %>%
+  add_xy_position(x = "year") %>% filter(p.adj < 0.05) %>% mutate(site = "WALK")
+
+dunn_all_year <- bind_rows(dunn_LEWI_y, dunn_MART_y, dunn_WALK_y) %>%
+  mutate(p.adj.label = ifelse(p.adj < 0.0001, "< 0.0001",
+                               formatC(p.adj, format = "g", digits = 3)))
+```
+
+
+# Combined year boxplots
+
+```{r}
+p_combined_year <- ggplot(alpha_df, aes(x = year, y = Shannon, fill = site)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+  stat_pvalue_manual(dunn_all_year,
+                     label = "{p.adj.label}",
+                     tip.length = 0.01,
+                     step.increase = 0.08,
+                     hide.ns = TRUE) +
+  scale_fill_manual(values = site_colors, guide = "none") +
+  scale_x_discrete(limits = c("2021", "2022", "2023")) +
+  facet_wrap(~ site, nrow = 1) +
+  labs(title    = "Fungal Shannon diversity by year across sites",
+       subtitle = "Kruskal-Wallis per site; Dunn's post-hoc with BH correction",
+       caption  = "Brackets show significant pairwise comparisons (p < 0.05). POSE: no significant annual differences.",
+       x        = "Year",
+       y        = "Shannon diversity index") +
+  theme_bw(base_size = 12) +
+  theme(plot.title       = element_text(face = "bold"),
+        plot.subtitle    = element_text(color = "grey40", size = 9),
+        plot.caption     = element_text(color = "grey40", size = 8, hjust = 0),
+        strip.text       = element_text(face = "bold", size = 11),
+        strip.background = element_rect(fill = "grey92"))
+
+p_combined_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_combined_year.png",
+       p_combined_year, width = 12, height = 6, dpi = 300)
+```
+
+# Final stacked summary panel
+```{r}
+final_summary <- p_combined_season / p_combined_year +
+  plot_annotation(
+    title   = "ITS alpha diversity - Shannon index across sites, seasons, and years",
+    caption = "178 samples rarefied to 4,900 reads. Kruskal-Wallis per site with Dunn's post-hoc (BH correction). α = 0.05.",
+    theme   = theme(plot.title   = element_text(face = "bold", size = 14),
+                    plot.caption = element_text(color = "grey40", size = 8, hjust = 0))
+  )
+
+final_summary
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/final_summary.png",
+       final_summary, width = 14, height = 10, dpi = 300)
+```
+
+
+## Save the alpha diversity df before moving on
+
+```{r}
+saveRDS(alpha_df, "~/Documents/NEON/March_final/ITS_tax/alpha_df_ITS.rds")
+cat("Alpha df saved!\n")
+```
+
+# Beta diversity 
+
+## ITS Bray-Curtis distance + PCoA (overall)
+
+```{r}
+# Compute Bray-Curtis distance matrix
+bc_dist <- phyloseq::distance(ps_rarefied, method = "bray")
+
+# PCoA ordination
+pcoa_overall <- ordinate(ps_rarefied, method = "PCoA", distance = bc_dist)
+
+# Extract eigenvalues to compute % variance explained per axis
+evals <- pcoa_overall$values$Eigenvalues
+pct   <- round(evals / sum(evals[evals > 0]) * 100, 1)
+
+cat("Variance explained:\n")
+cat("PC1:", pct[1], "%\n")
+cat("PC2:", pct[2], "%\n")
+cat("PC3:", pct[3], "%\n")
+
+# Build a dataframe of PCoA scores joined to metadata
+scores_overall <- as.data.frame(pcoa_overall$vectors[, 1:3])
+colnames(scores_overall) <- c("PC1", "PC2", "PC3")
+scores_overall$sample_id <- gsub("\\.", "_", rownames(scores_overall))
+
+meta_vegan <- as(sample_data(ps_rarefied), "data.frame") %>%
+  mutate(year = factor(year))
+
+pcoa_df <- left_join(
+  scores_overall,
+  meta_vegan %>% rownames_to_column("sample_id"),
+  by = "sample_id")
+
+# Verify the join worked
+sum(is.na(pcoa_df$site))
+```
+-  ITS is lower because fungal communities are patchier and more sparse - more "rare and different" taxa per sample, so variation gets spread across more axes. This is normal and expected
+
+
+## Overall PERMANOVA - site, season, year
+
+###  PERMANOVA - Bray-Curtis ~ site
+
+H0: Fungal community composition does not differ across sites
+
+HA: Fungal community composition differs in at least one site
+
+```{r}
+set.seed(123)
+perm_site <- adonis2(bc_dist ~ site, data = meta_vegan, permutations = 999)
+print(perm_site)
+```
+- Fungal community composition differed significantly across sites (PERMANOVA: R² = 0.151, F = 10.33, df = 3, p = 0.001).
+- Reject H0 - fungal community composition differs in at least one site.
+- Site explains 15.1% of the variance in Bray-Curtis dissimilarity, the largest effect of any single grouping factor.
+
+
+### PERMANOVA - Bray-Curtis ~ season
+
+H0: Fungal community composition does not differ across seasons
+
+HA: Fungal community composition differs in at least one season
+
+```{r}
+set.seed(123)
+perm_season <- adonis2(bc_dist ~ season, data = meta_vegan, permutations = 999)
+print(perm_season)
+```
+- Fungal community composition differed significantly across seasons (PERMANOVA: R² = 0.059, F = 5.47, df = 2, p = 0.001).
+- Reject H0 - fungal community composition differs in at least one season.
+- Season explains 5.9% of the variance - significant but smaller than site.
+
+
+### PERMANOVA - Bray-Curtis ~ year
+
+H0: Fungal community composition does not differ across years
+
+HA: Fungal community composition differs in at least one year
+
+```{r}
+set.seed(123)
+perm_year <- adonis2(bc_dist ~ year, data = meta_vegan, permutations = 999)
+print(perm_year)
+```
+- Fungal community composition differed significantly across years (PERMANOVA: R² = 0.022, F = 1.98, df = 2, p = 0.001).
+- Reject H0 - fungal community composition differs in at least one year.
+- Year explains 2.2% of the variance - significant but the smallest effect of the three.
+
+Key takeaway: Site is by far the strongest driver of fungal community composition, followed by season, then year. This hierarchy (site > season > year) is biologically sensible - sites have stable environmental differences (geology, hydrology, watershed land use), seasons impose recurring environmental cycles, and year captures shorter-term stochastic variation.
+
+Worth noting that 76.8% of variance is unexplained - that's normal for environmental fungal communities and reflects sample-level heterogeneity within site-season-year combinations.
+
+## Overall full marginal PERMANOVA - site + season + year
+
+To estimate the unique contribution of each factor while accounting for
+the other two, an overall PERMANOVA was fit with site, season, and year
+as predictors using marginal sums of squares (adonis2, by = "margin",
+999 permutations). This complements the three univariate PERMANOVAs
+above by separating each factor's effect from the others at the
+dataset level.
+
+```{r overall-full-marginal-permanova}
+set.seed(123)
+
+meta_full <- as(sample_data(ps_rarefied), "data.frame") %>%
+  mutate(season = factor(season, levels = c("Spring", "Summer", "Fall")),
+         year   = factor(year))
+
+perm_full <- adonis2(bc_dist ~ site + season + year,
+                     data = meta_full,
+                     permutations = 999,
+                     by = "margin")
+
+print(perm_full)
+```
+
+## PERMDISP - dispersion by site
+
+PERMANOVA can return a significant result either because group centroids
+differ (location effect, what we want to detect) or because group
+dispersions differ (spread effect, a confound). To distinguish these,
+PERMDISP was run on the same Bray-Curtis distance matrix using betadisper
+with site as the grouping factor and tested with 999 permutations.
+
+```{r permdisp-site}
+# PERMDISP - site
+disp_site <- betadisper(bc_dist, meta_full$site)
+
+set.seed(123)
+perm_disp_site <- permutest(disp_site, permutations = 999)
+print(perm_disp_site)
+```
+
+```{r permdisp-site-plot}
+plot(disp_site,
+     main = "PERMDISP - dispersion by site",
+     col  = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3"))
+```
+
+## Overall PCoA plot - colored by site
+
+```{r overall-pcoa-marginal-subtitle}
+# Build the marginal subtitle string from the full model output (site row)
+overall_subtitle <- sprintf(
+  "PERMANOVA (marginal): R\u00b2 = %.3f, F = %.3f, p = %.3f",
+  perm_full$R2[1], perm_full$F[1], perm_full$`Pr(>F)`[1]
+)
+overall_subtitle
+```
+
+```{r overall-pcoa-pc1-pc2}
+p_beta_overall_pc12 <- ggplot(pcoa_df, aes(x = PC1, y = PC2, color = site)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(group = site), level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = site_colors, name = "Site") +
+  labs(title    = "Fungal community composition - Bray-Curtis PCoA (PC1 vs PC2)",
+       subtitle = overall_subtitle,
+       x        = paste0("PC1 (", pct[1], "%)"),
+       y        = paste0("PC2 (", pct[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40", size = 10))
+
+p_beta_overall_pc12
+
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_overall_pc12.png",
+       p_beta_overall_pc12, width = 10, height = 8, dpi = 300)
+```
+
+```{r overall-pcoa-pc1-pc3}
+p_beta_overall_pc13 <- ggplot(pcoa_df, aes(x = PC1, y = PC3, color = site)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(group = site), level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = site_colors, name = "Site") +
+  labs(title    = "Fungal community composition - Bray-Curtis PCoA (PC1 vs PC3)",
+       subtitle = overall_subtitle,
+       x        = paste0("PC1 (", pct[1], "%)"),
+       y        = paste0("PC3 (", pct[3], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey40", size = 10))
+
+p_beta_overall_pc13
+
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_overall_pc13.png",
+       p_beta_overall_pc13, width = 10, height = 8, dpi = 300)
+```
+
+```{r overall-pcoa-combined, fig.width=18, fig.height=8}
+p_beta_overall_combined <- (p_beta_overall_pc12 + p_beta_overall_pc13) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Overall fungal community composition - Bray-Curtis PCoA",
+    subtitle = "Site clustering shown across the first three principal coordinates",
+    theme    = theme(
+      plot.title    = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(color = "grey40", size = 11)
+    )
+  ) &
+  theme(legend.position = "right")
+
+p_beta_overall_combined
+
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_overall_combined.png",
+       p_beta_overall_combined, width = 18, height = 8, dpi = 300)
+```
+
+
+## Per site full marginal PERMANOVA
+
+To investigate temporal patterns in fungal community composition while
+controlling for the dominant site effect, per-site PERMANOVAs were
+performed by subsetting the data to each site and testing season and
+year using marginal sums of squares (adonis2, by = "margin", 999
+permutations). Each per-site model uses Type III sums of squares to
+test season and year while accounting for each other.
+
+```{r per-site-marginal-permanova-verbose}
+set.seed(123)
+
+# Helper to print verbose per-site marginal PERMANOVA to console
+run_site_marginal <- function(ps_obj, site_name) {
+  keep_samples <- sample_data(ps_obj)$site == site_name
+  ps_site  <- prune_samples(keep_samples, ps_obj)
+  
+  bc_site  <- phyloseq::distance(ps_site, method = "bray")
+  meta_site <- as(sample_data(ps_site), "data.frame") %>%
+    mutate(season = factor(season, levels = c("Spring", "Summer", "Fall")),
+           year   = factor(year))
+  
+  cat("\n========================================\n")
+  cat(site_name, " marginal PERMANOVA (season + year)\n")
+  cat("========================================\n")
+  perm_marg <- adonis2(bc_site ~ season + year,
+                       data = meta_site,
+                       permutations = 999,
+                       by = "margin")
+  print(perm_marg)
+  invisible(perm_marg)
+}
+
+perm_LEWI_marg <- run_site_marginal(ps_rarefied, "LEWI")
+perm_MART_marg <- run_site_marginal(ps_rarefied, "MART")
+perm_POSE_marg <- run_site_marginal(ps_rarefied, "POSE")
+perm_WALK_marg <- run_site_marginal(ps_rarefied, "WALK")
+```
+
+```{r per-site-marginal-stats-table}
+set.seed(123)
+
+# Helper that returns marginal PERMANOVA results as a tidy data frame
+get_site_marginal_stats <- function(ps_obj, site_name) {
+  keep_samples <- sample_data(ps_obj)$site == site_name
+  ps_site  <- prune_samples(keep_samples, ps_obj)
+  
+  bc_site  <- phyloseq::distance(ps_site, method = "bray")
+  meta_site <- as(sample_data(ps_site), "data.frame") %>%
+    mutate(season = factor(season, levels = c("Spring", "Summer", "Fall")),
+           year   = factor(year))
+  
+  perm_marg <- adonis2(bc_site ~ season + year,
+                       data = meta_site,
+                       permutations = 999,
+                       by = "margin")
+  
+  data.frame(
+    site   = site_name,
+    term   = c("season", "year"),
+    R2     = c(perm_marg$R2[1], perm_marg$R2[2]),
+    F_stat = c(perm_marg$F[1],  perm_marg$F[2]),
+    p_val  = c(perm_marg$`Pr(>F)`[1], perm_marg$`Pr(>F)`[2])
+  )
+}
+
+marginal_stats <- bind_rows(
+  get_site_marginal_stats(ps_rarefied, "LEWI"),
+  get_site_marginal_stats(ps_rarefied, "MART"),
+  get_site_marginal_stats(ps_rarefied, "POSE"),
+  get_site_marginal_stats(ps_rarefied, "WALK")
+)
+
+print(marginal_stats)
+```
+
+```{r make-subtitle-helper}
+# Helper to format the subtitle string from marginal_stats
+make_subtitle <- function(stats_df, site_name, term_name) {
+  row <- stats_df %>% filter(site == site_name, term == term_name)
+  sprintf("PERMANOVA (marginal): R\u00b2 = %.3f, F = %.3f, p = %.3f",
+          row$R2, row$F_stat, row$p_val)
+}
+```
+
+## LEWI subset, distance, PCoA
+
+```{r}
+ps_LEWI <- subset_samples(ps_rarefied, site == "LEWI")
+bc_LEWI <- phyloseq::distance(ps_LEWI, method = "bray")
+pcoa_LEWI <- ordinate(ps_LEWI, method = "PCoA", distance = bc_LEWI)
+
+evals_LEWI <- pcoa_LEWI$values$Eigenvalues
+pct_LEWI   <- round(evals_LEWI / sum(evals_LEWI[evals_LEWI > 0]) * 100, 1)
+
+scores_LEWI <- as.data.frame(pcoa_LEWI$vectors[, 1:2])
+colnames(scores_LEWI) <- c("PC1", "PC2")
+scores_LEWI$sample_id <- gsub("\\.", "_", rownames(scores_LEWI))
+
+meta_LEWI_vegan <- as(sample_data(ps_LEWI), "data.frame") %>%
+  mutate(year = factor(year))
+
+pcoa_df_LEWI <- left_join(
+  scores_LEWI,
+  meta_LEWI_vegan %>% rownames_to_column("sample_id"),
+  by = "sample_id")
+
+cat("LEWI PC1:", pct_LEWI[1], "%\n")
+cat("LEWI PC2:", pct_LEWI[2], "%\n")
+cat("NAs in site after join:", sum(is.na(pcoa_df_LEWI$site)), "\n")
+```
+
+
+
+## LEWI PERMANOVA - Bray-Curtis ~ season
+
+H0: Fungal community composition does not differ across seasons within the LEWI site
+HA: Fungal community composition differs in at least one season within the LEWI site
+
+```{r}
+set.seed(123)
+perm_LEWI_season <- adonis2(bc_LEWI ~ season, data = meta_LEWI_vegan, permutations = 999)
+print(perm_LEWI_season)
+```
+
+## LEWI Bray-Curtis PCoA by season - plot
+
+```{r}
+season_reds <- c("Spring" = "#F4A8A8",
+                 "Summer" = "#E41A1C",
+                 "Fall"   = "#7A0F11")
+
+p_beta_LEWI_season <- ggplot(pcoa_df_LEWI, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = season), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = season, color = season),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = season_reds, name = "Season") +
+  labs(title    = "LEWI - Bray-Curtis PCoA by season",
+       subtitle = make_subtitle(marginal_stats, "LEWI", "season"),
+       x        = paste0("PC1 (", pct_LEWI[1], "%)"),
+       y        = paste0("PC2 (", pct_LEWI[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_beta_LEWI_season
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_LEWI_season.png",
+       p_beta_LEWI_season, width = 10, height = 8, dpi = 300)
+```
+- Spring (light pink) clusters tightly in the lower-left - distinct compositional space
+- Summer (medium red) clusters tightly in the upper-middle - also distinct
+- Fall (dark red) sits in a wider band on the right - more variable
+- All three ellipses are nearly non-overlapping → that's the 31.3% R² visualized
+- The big Fall ellipse means Fall samples are more compositionally heterogeneous than Spring or Summer samples
+
+## LEWI PERMANOVA - Bray-Curtis ~ year
+
+H0: Fungal community composition does not differ across years within the LEWI site
+
+HA: Fungal community composition differs in at least one year within the LEWI site
+
+```{r}
+set.seed(123)
+perm_LEWI_year <- adonis2(bc_LEWI ~ year, data = meta_LEWI_vegan, permutations = 999)
+print(perm_LEWI_year)
+```
+- Within LEWI, fungal community composition differed significantly across years (PERMANOVA: R² = 0.155, F = 1.93, df = 2, p = 0.004).
+- Reject H0 - fungal community composition differs in at least one year within LEWI.
+- Year explains 15.5% of within-LEWI variance in Bray-Curtis dissimilarity.
+- Year is half the size of the seasonal effect at LEWI (R² year = 0.155 vs R² season = 0.313), but still substantial - meaning LEWI fungal communities show real interannual compositional shifts on top of the dominant seasonal cycle.
+- Worth noting in your discussion: alpha diversity at LEWI by year was significant (KW p = 0.020) with 2022 > 2021. The beta diversity result confirms interannual change runs deeper than just diversity counts - community composition itself is shifting.
+
+
+## LEWI Bray-Curtis PCoA by year - plot
+
+```{r}
+year_reds <- c("2021" = "#F4A8A8",
+               "2022" = "#E41A1C",
+               "2023" = "#7A0F11")
+
+p_beta_LEWI_year <- ggplot(pcoa_df_LEWI, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = year, color = year),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = year_reds, name = "Year") +
+  labs(title    = "LEWI - Bray-Curtis PCoA by year",
+       subtitle = make_subtitle(marginal_stats, "LEWI", "year"),
+       x        = paste0("PC1 (", pct_LEWI[1], "%)"),
+       y        = paste0("PC2 (", pct_LEWI[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_beta_LEWI_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_LEWI_year.png",
+       p_beta_LEWI_year, width = 10, height = 8, dpi = 300)
+```
+
+- LEWI annual fungal community composition was visualized with Bray-Curtis PCoA. Year ellipses overlapped substantially, consistent with the modest R² (0.155) compared to the seasonal effect (R² = 0.313).
+- 2021 showed the widest dispersion and 2022 was most compact.
+- A MASS::cov.trob convergence warning during ellipse fitting reflects the small per-year sample size at LEWI (n ≈ 7–9 per year) and does not affect the PERMANOVA result.
+
+## MART subset, distance, PCoA
+
+```{r}
+ps_MART <- subset_samples(ps_rarefied, site == "MART")
+bc_MART <- phyloseq::distance(ps_MART, method = "bray")
+pcoa_MART <- ordinate(ps_MART, method = "PCoA", distance = bc_MART)
+
+evals_MART <- pcoa_MART$values$Eigenvalues
+pct_MART   <- round(evals_MART / sum(evals_MART[evals_MART > 0]) * 100, 1)
+
+scores_MART <- as.data.frame(pcoa_MART$vectors[, 1:2])
+colnames(scores_MART) <- c("PC1", "PC2")
+scores_MART$sample_id <- gsub("\\.", "_", rownames(scores_MART))
+
+meta_MART_vegan <- as(sample_data(ps_MART), "data.frame") %>%
+  mutate(year = factor(year))
+
+pcoa_df_MART <- left_join(
+  scores_MART,
+  meta_MART_vegan %>% rownames_to_column("sample_id"),
+  by = "sample_id")
+
+cat("MART PC1:", pct_MART[1], "%\n")
+cat("MART PC2:", pct_MART[2], "%\n")
+cat("NAs in site after join:", sum(is.na(pcoa_df_MART$site)), "\n")
+```
+
+- MART PC1 = 24.2%, PC2 = 7.2% - together 31.4% of within-MART variance captured in 2D
+- MART has the highest within-site PC1 of any site so far (LEWI = 20.3%, MART = 24.2%) - meaning there's a strong dominant axis of variation within MART
+- Join verified - 0 NAs
+
+
+## MART PERMANOVA - Bray-Curtis ~ season
+
+H0: Fungal community composition does not differ across seasons within the MART site
+
+HA: Fungal community composition differs in at least one season within the MART site
+
+```{r}
+set.seed(123)
+perm_MART_season <- adonis2(bc_MART ~ season, data = meta_MART_vegan, permutations = 999)
+print(perm_MART_season)
+```
+- Within MART, fungal community composition differed significantly across seasons (PERMANOVA: R² = 0.155, F = 5.97, df = 2, p = 0.001).
+- Reject H0 - fungal community composition differs in at least one season within MART.
+- Season explains 15.5% of within-MART variance in Bray-Curtis dissimilarity.
+- Worth noting: this is half the seasonal effect we saw at LEWI (R² = 0.313). MART has more within-site heterogeneity that isn't explained by season - likely reflects MART's larger sample size (n = 68) capturing more environmental variability across the 9 collection events.
+- Aligns with alpha diversity at MART by season: KW p = 0.0054 with Fall > Summer. Beta confirms compositional turnover, especially distinguishing Fall from the other seasons.
+
+## MART Bray-Curtis PCoA by season - plot
+
+```{r}
+season_blues <- c("Spring" = "#9EC4E0",
+                  "Summer" = "#377EB8",
+                  "Fall"   = "#1A4A7A")
+
+p_beta_MART_season <- ggplot(pcoa_df_MART, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = season), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = season, color = season),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = season_blues, name = "Season") +
+  labs(title    = "MART - Bray-Curtis PCoA by season",
+       subtitle = make_subtitle(marginal_stats, "MART", "season"),
+       x        = paste0("PC1 (", pct_MART[1], "%)"),
+       y        = paste0("PC2 (", pct_MART[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_beta_MART_season
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_MART_season.png",
+       p_beta_MART_season, width = 10, height = 8, dpi = 300)
+```
+- Fall (dark blue) clusters tightly to the right with a compact ellipse - distinct compositional space
+- Spring (light blue) sits to the left/center with a wide ellipse spanning the negative PC1 region
+- Summer (medium blue) is intermediate and most spread out, the largest ellipse - most compositionally heterogeneous
+- The R² = 15.5% is visible as the modest separation: Fall is well-separated, but Spring and Summer overlap substantially
+- This visual matches the alpha diversity result where Fall was significantly different from Summer at MART
+
+
+## MART PERMANOVA - Bray-Curtis ~ year
+
+H0: Fungal community composition does not differ across years within the MART site
+
+HA: Fungal community composition differs in at least one year within the MART site
+
+```{r}
+set.seed(123)
+perm_MART_year <- adonis2(bc_MART ~ year, data = meta_MART_vegan, permutations = 999)
+print(perm_MART_year)
+```
+- Within MART, fungal community composition differed significantly across years (PERMANOVA: R² = 0.074, F = 2.59, df = 2, p = 0.002).
+- Reject H0 - fungal community composition differs in at least one year within MART.
+- Year explains 7.4% of within-MART variance in Bray-Curtis dissimilarity.
+- Year is about half the size of the seasonal effect at MART (R² year = 0.074 vs R² season = 0.155) - same hierarchical pattern as LEWI (season > year).
+- Aligns with the alpha diversity result for MART by year (KW p = 0.0004, with 2023 > 2021 and 2023 > 2022) - beta confirms compositional turnover across the 3-year window, not just diversity-level change.
+
+
+## MART Bray-Curtis PCoA by year - plot
+
+```{r}
+year_blues <- c("2021" = "#9EC4E0",
+                "2022" = "#377EB8",
+                "2023" = "#1A4A7A")
+
+p_beta_MART_year <- ggplot(pcoa_df_MART, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = year, color = year),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = year_blues, name = "Year") +
+  labs(title    = "MART - Bray-Curtis PCoA by year",
+       subtitle = make_subtitle(marginal_stats, "MART", "year"),
+       x        = paste0("PC1 (", pct_MART[1], "%)"),
+       y        = paste0("PC2 (", pct_MART[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_beta_MART_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_MART_year.png",
+       p_beta_MART_year, width = 10, height = 8, dpi = 300)
+```
+- 2021 (light blue) sits left/center with a wide ellipse spanning negative PC1 - most compositionally variable year
+- 2022 (medium blue) has the largest ellipse - most spread out across PC1
+- 2023 (dark blue) clusters more to the right, with samples concentrated in the lower-right quadrant
+- All three ellipses overlap substantially → consistent with the modest 7.4% R²
+- The right-shift of 2023 samples vs 2021 is visible - supports the alpha diversity finding that 2023 had higher Shannon diversity, and aligns with progressive year-over-year compositional change at MART
+
+
+
+## POSE subset, distance, PCoA
+
+```{r}
+ps_POSE <- subset_samples(ps_rarefied, site == "POSE")
+bc_POSE <- phyloseq::distance(ps_POSE, method = "bray")
+pcoa_POSE <- ordinate(ps_POSE, method = "PCoA", distance = bc_POSE)
+
+evals_POSE <- pcoa_POSE$values$Eigenvalues
+pct_POSE   <- round(evals_POSE / sum(evals_POSE[evals_POSE > 0]) * 100, 1)
+
+scores_POSE <- as.data.frame(pcoa_POSE$vectors[, 1:2])
+colnames(scores_POSE) <- c("PC1", "PC2")
+scores_POSE$sample_id <- gsub("\\.", "_", rownames(scores_POSE))
+
+meta_POSE_vegan <- as(sample_data(ps_POSE), "data.frame") %>%
+  mutate(year = factor(year))
+
+pcoa_df_POSE <- left_join(
+  scores_POSE,
+  meta_POSE_vegan %>% rownames_to_column("sample_id"),
+  by = "sample_id")
+
+cat("POSE PC1:", pct_POSE[1], "%\n")
+cat("POSE PC2:", pct_POSE[2], "%\n")
+cat("NAs in site after join:", sum(is.na(pcoa_df_POSE$site)), "\n")
+```
+
+- POSE PC1 = 21.5%, PC2 = 12.2% - together 33.7% of within-POSE variance captured in 2D
+- Comparable to LEWI (33.8% combined), more than MART (31.4% combined)
+- Join verified - 0 NAs
+
+
+## POSE PERMANOVA - Bray-Curtis ~ season
+
+H0: Fungal community composition does not differ across seasons within the POSE site
+
+HA: Fungal community composition differs in at least one season within the POSE site
+
+```{r}
+set.seed(123)
+perm_POSE_season <- adonis2(bc_POSE ~ season, data = meta_POSE_vegan, permutations = 999)
+print(perm_POSE_season)
+```
+- Within POSE, fungal community composition differed significantly across seasons (PERMANOVA: R² = 0.322, F = 9.98, df = 2, p = 0.001).
+- Reject H0 - fungal community composition differs in at least one season within POSE.
+- Season explains 32.2% of within-POSE variance in Bray-Curtis dissimilarity - the strongest seasonal beta diversity result of any site (POSE 32.2% > LEWI 31.3% > MART 15.5%).
+- Aligns with alpha diversity at POSE (KW p = 0.0047) where Spring was significantly higher than both Summer and Fall - beta diversity confirms that POSE undergoes major seasonal compositional turnover.
+- POSE pattern: a ~1/3 of within-site community variance is explained by season alone - indicating a strong seasonal driver at this site.
+
+
+## POSE Bray-Curtis PCoA by season - plot
+
+```{r}
+season_greens <- c("Spring" = "#B8E0B8",
+                   "Summer" = "#4DAF4A",
+                   "Fall"   = "#1A5C1A")
+
+p_beta_POSE_season <- ggplot(pcoa_df_POSE, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = season), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = season, color = season),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = season_greens, name = "Season") +
+  labs(title    = "POSE - Bray-Curtis PCoA by season",
+       subtitle = make_subtitle(marginal_stats, "POSE", "season"),
+       x        = paste0("PC1 (", pct_POSE[1], "%)"),
+       y        = paste0("PC2 (", pct_POSE[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_beta_POSE_season
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_POSE_season.png",
+       p_beta_POSE_season, width = 10, height = 8, dpi = 300)
+```
+
+- Three distinct compositional regions, one per season - Spring upper-left, Summer lower-center, Fall upper-right
+- No ellipse overlap whatsoever - each season occupies its own corner of compositional space
+- Tight within-season clustering - each season's samples are highly similar to each other, indicating a stable seasonal signature at POSE
+- This is the single strongest seasonal signal in the entire study - alpha + beta combined, POSE Spring is dramatically distinct from POSE Summer/Fall
+
+Why this matters biologically
+- POSE shows the most temporally cyclic fungal community of any site:
+  + Each season has a distinct fungal community fingerprint
+  + The community resets every season in a recurring pattern
+  + Spring fungi at POSE are not the same fungi as Summer or Fall
+
+- This is the cleanest example in your dataset of fungal community phenology - seasonal turnover of distinct taxonomic communities.
+
+- POSE seasonal fungal community composition was visualized with Bray-Curtis PCoA. Three completely non-overlapping ellipses indicate distinct compositional spaces for each season.
+- Spring samples clustered in the upper-left quadrant, Summer in the lower-center, and Fall in the upper-right.
+- Tight within-season clustering combined with strong between-season separation reflects the high R² (0.322) and is consistent with the strong PERMANOVA result (F = 9.98, p = 0.001).
+- This is the strongest seasonal beta diversity signal of any site in the study.
+
+## POSE PERMANOVA - Bray-Curtis ~ year
+
+H0: Fungal community composition does not differ across years within the POSE site
+
+HA: Fungal community composition differs in at least one year within the POSE site
+
+```{r}
+set.seed(123)
+perm_POSE_year <- adonis2(bc_POSE ~ year, data = meta_POSE_vegan, permutations = 999)
+print(perm_POSE_year)
+```
+- Within POSE, fungal community composition differed significantly across years (PERMANOVA: R² = 0.091, F = 2.11, df = 2, p = 0.005).
+- Reject H0 - fungal community composition differs in at least one year within POSE.
+- Year explains 9.1% of within-POSE variance in Bray-Curtis dissimilarity.
+- Important contrast: alpha diversity at POSE by year was NOT significant (KW p = 0.097), but beta diversity by year IS significant (PERMANOVA p = 0.005).
+- This pattern indicates community turnover without diversity change - POSE samples maintained similar levels of fungal Shannon diversity across years, but the identity of taxa shifted year-to-year.
+- This is a key biological finding worth highlighting: POSE has temporally cyclic seasonal communities (R² season = 32.2%) layered with a smaller interannual compositional shift, but neither shifts the overall diversity level much.
+- Same alpha/beta decoupling pattern your 16S WALK showed - different metric, different lens.
+
+
+## POSE Bray-Curtis PCoA by year - plot
+
+```{r}
+year_greens <- c("2021" = "#B8E0B8",
+                 "2022" = "#4DAF4A",
+                 "2023" = "#1A5C1A")
+
+p_beta_POSE_year <- ggplot(pcoa_df_POSE, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = year, color = year),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = year_greens, name = "Year") +
+  labs(title    = "POSE - Bray-Curtis PCoA by year",
+       subtitle = make_subtitle(marginal_stats, "POSE", "year"),
+       x        = paste0("PC1 (", pct_POSE[1], "%)"),
+       y        = paste0("PC2 (", pct_POSE[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_beta_POSE_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_POSE_year.png",
+       p_beta_POSE_year, width = 10, height = 8, dpi = 300)
+```
+- POSE annual fungal community composition was visualized with Bray-Curtis PCoA. All three year ellipses overlapped almost completely, consistent with the modest R² = 0.091.
+- The three visible clusters reflect the dominant seasonal structure (Spring left, Summer center, Fall right) - within each seasonal cluster, samples are distributed across all three years.
+- This pattern indicates that interannual compositional shifts at POSE are subtle relative to the strong seasonal cycle.
+- The PERMANOVA result (p = 0.005) confirms that year-over-year shifts are statistically real, but the visual is dominated by the much stronger seasonal signal.
+
+
+## WALK subset, distance, PCoA
+
+```{r}
+ps_WALK <- subset_samples(ps_rarefied, site == "WALK")
+bc_WALK <- phyloseq::distance(ps_WALK, method = "bray")
+pcoa_WALK <- ordinate(ps_WALK, method = "PCoA", distance = bc_WALK)
+
+evals_WALK <- pcoa_WALK$values$Eigenvalues
+pct_WALK   <- round(evals_WALK / sum(evals_WALK[evals_WALK > 0]) * 100, 1)
+
+scores_WALK <- as.data.frame(pcoa_WALK$vectors[, 1:2])
+colnames(scores_WALK) <- c("PC1", "PC2")
+scores_WALK$sample_id <- gsub("\\.", "_", rownames(scores_WALK))
+
+meta_WALK_vegan <- as(sample_data(ps_WALK), "data.frame") %>%
+  mutate(year = factor(year))
+
+pcoa_df_WALK <- left_join(
+  scores_WALK,
+  meta_WALK_vegan %>% rownames_to_column("sample_id"),
+  by = "sample_id")
+
+cat("WALK PC1:", pct_WALK[1], "%\n")
+cat("WALK PC2:", pct_WALK[2], "%\n")
+cat("NAs in site after join:", sum(is.na(pcoa_df_WALK$site)), "\n")
+```
+
+- WALK PC1 = 10.1%, PC2 = 6.7% - together 16.8% of within-WALK variance captured in 2D
+- These are the lowest within-site PC1/PC2 values of any site (LEWI 33.8%, MART 31.4%, POSE 33.7%, WALK 16.8%) - meaning WALK has more diffuse, multi-axis compositional structure with no single dominant axis
+- This is consistent with WALK's overall pattern of high within-site heterogeneity
+- Join verified - 0 NAs
+
+
+## WALK PERMANOVA - Bray-Curtis ~ season
+
+H0: Fungal community composition does not differ across seasons within the WALK site
+
+HA: Fungal community composition differs in at least one season within the WALK site
+
+```{r}
+set.seed(123)
+perm_WALK_season <- adonis2(bc_WALK ~ season, data = meta_WALK_vegan, permutations = 999)
+print(perm_WALK_season)
+```
+- Within WALK, fungal community composition differed significantly across seasons (PERMANOVA: R² = 0.113, F = 2.42, df = 2, p = 0.001).
+- Reject H0 - fungal community composition differs in at least one season within WALK.
+- Season explains 11.3% of within-WALK variance in Bray-Curtis dissimilarity.
+- Critical finding: alpha/beta decoupling at WALK. Alpha diversity at WALK by season was completely flat (KW p = 0.765 - the most non-significant alpha result in the entire study), but beta diversity by season is significant (PERMANOVA p = 0.001).
+- Biological interpretation: at WALK, fungal communities maintain a stable level of diversity across seasons (same Shannon values), but the identity of taxa shifts seasonally. This is community turnover without diversity change - different species replacing each other across seasons while keeping overall community evenness/richness similar.
+- This exactly mirrors your 16S WALK pattern (alpha NS, beta significant) - suggesting WALK's epilithon, regardless of marker, has this same temporal compositional turnover signature.
+- Among the 4 sites, WALK has the most decoupled alpha and beta seasonal signals - making it the most distinctive site behaviorally.
+
+
+## WALK Bray-Curtis PCoA by season - plot
+
+```{r}
+season_purples <- c("Spring" = "#D4A8E0",
+                    "Summer" = "#984EA3",
+                    "Fall"   = "#4A1A5C")
+
+p_beta_WALK_season <- ggplot(pcoa_df_WALK, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = season), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = season, color = season),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = season_purples, name = "Season") +
+  labs(title    = "WALK - Bray-Curtis PCoA by season",
+       subtitle = make_subtitle(marginal_stats, "WALK", "season"),
+       x        = paste0("PC1 (", pct_WALK[1], "%)"),
+       y        = paste0("PC2 (", pct_WALK[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_beta_WALK_season
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_WALK_season.png",
+       p_beta_WALK_season, width = 10, height = 8, dpi = 300)
+```
+- WALK seasonal fungal community composition was visualized with Bray-Curtis PCoA. Fall samples extended along PC1 into a compositional region distinct from Spring and Summer, which clustered together on the left side of the plot.
+- Spring and Summer samples occupied overlapping compositional space, while the Fall ellipse stretched broadly across PC1 indicating both compositional separation from Spring/Summer and high within-Fall variability.
+- The seasonal beta diversity signal at WALK (R² = 0.113) is driven primarily by Fall communities being distinct from Spring and Summer, rather than by three fully separated seasonal fingerprints.
+- This contrasts with POSE, where each of the three seasons occupied distinct, non-overlapping compositional space.
+
+
+
+## WALK PERMANOVA - Bray-Curtis ~ year
+
+H0: Fungal community composition does not differ across years within the WALK site
+
+HA: Fungal community composition differs in at least one year within the WALK site
+
+```{r}
+set.seed(123)
+perm_WALK_year <- adonis2(bc_WALK ~ year, data = meta_WALK_vegan, permutations = 999)
+print(perm_WALK_year)
+```
+- Within WALK, fungal community composition differed significantly across years (PERMANOVA: R² = 0.081, F = 1.68, df = 2, p = 0.001).
+- Reject H0 - fungal community composition differs in at least one year within WALK.
+- Year explains 8.1% of within-WALK variance in Bray-Curtis dissimilarity.
+- Year is slightly weaker than season at WALK (R² year = 0.081 vs R² season = 0.113), and both are smaller than at the other sites - WALK has the most diffuse, multi-axis compositional structure overall.
+- Aligns with WALK alpha diversity by year (KW p = 0.031, with 2022 > 2021) - beta confirms compositional turnover across years, not just diversity changes.
+- WALK is significant for both season and year by PERMANOVA, even though it was alpha-flat for season - this site has rich multi-temporal compositional dynamics that wouldn't be captured by alpha diversity alone.
+
+
+## WALK Bray-Curtis PCoA by year - plot
+
+```{r}
+year_purples <- c("2021" = "#D4A8E0",
+                  "2022" = "#984EA3",
+                  "2023" = "#4A1A5C")
+
+p_beta_WALK_year <- ggplot(pcoa_df_WALK, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = year), size = 4, alpha = 1) +
+  stat_ellipse(aes(group = year, color = year),
+               level = 0.95, linetype = "dashed", linewidth = 0.8) +
+  scale_color_manual(values = year_purples, name = "Year") +
+  labs(title    = "WALK - Bray-Curtis PCoA by year",
+       subtitle = make_subtitle(marginal_stats, "WALK", "year"),
+       x        = paste0("PC1 (", pct_WALK[1], "%)"),
+       y        = paste0("PC2 (", pct_WALK[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title    = element_text(face = "bold", color = "black"),
+        plot.subtitle = element_text(color = "grey40", size = 9))
+
+p_beta_WALK_year
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_WALK_year.png",
+       p_beta_WALK_year, width = 10, height = 8, dpi = 300)
+```
+
+- WALK annual fungal community composition was visualized with Bray-Curtis PCoA. All three year ellipses overlapped substantially, consistent with the modest R² = 0.081.
+- 2021 showed the largest dispersion, with several outlier samples extending to the lower portion of the plot - these may represent a particular collection event with atypical fungal community composition.
+- 2022 samples clustered most tightly in the center, indicating compositional consistency within that year.
+- 2023 samples occupied the upper-center region with moderate spread.
+- Despite the modest R², the year effect was statistically significant (p = 0.001), reflecting real interannual compositional shifts at WALK.
+
+## Combined PCoA plot
+
+```{r combined-pcoa-panels, fig.width=14, fig.height=12}
+# ---- Panel 1: All 4 sites seasonal PCoA (2x2 grid) ----
+p_panel_seasonal <- (p_beta_LEWI_season + p_beta_MART_season) /
+                    (p_beta_POSE_season + p_beta_WALK_season) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Per-site Bray-Curtis PCoA by season",
+    subtitle = "Fungal community composition variation across seasons within each site",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(color = "grey40", size = 10)
+    )
+  ) &
+  theme(legend.position = "right")
+
+p_panel_seasonal
+
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_seasonal_per_site_panel.png",
+       p_panel_seasonal, width = 14, height = 12, dpi = 300)
+```
+
+```{r combined-pcoa-annual, fig.width=14, fig.height=12}
+# ---- Panel 2: All 4 sites annual PCoA (2x2 grid) ----
+p_panel_annual <- (p_beta_LEWI_year + p_beta_MART_year) /
+                  (p_beta_POSE_year + p_beta_WALK_year) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Per-site Bray-Curtis PCoA by year",
+    subtitle = "Fungal community composition variation across sampling years within each site",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(color = "grey40", size = 10)
+    )
+  ) &
+  theme(legend.position = "right")
+
+p_panel_annual
+
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_annual_per_site_panel.png",
+       p_panel_annual, width = 14, height = 12, dpi = 300)
+```
+
+```{r combined-pcoa-8panel, fig.width=14, fig.height=24}
+# ---- Panel 3: Big combined 8-plot panel (4x2 grid) ----
+p_panel_combined <- (p_beta_LEWI_season + p_beta_LEWI_year) /
+                    (p_beta_MART_season + p_beta_MART_year) /
+                    (p_beta_POSE_season + p_beta_POSE_year) /
+                    (p_beta_WALK_season + p_beta_WALK_year) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Per-site Bray-Curtis PCoA - season and year",
+    subtitle = "Seasonal (left column) and annual (right column) fungal community composition within each site",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(color = "grey40", size = 11)
+    )
+  ) &
+  theme(legend.position = "right")
+
+p_panel_combined
+
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_beta_per_site_combined_8panel.png",
+       p_panel_combined, width = 14, height = 24, dpi = 300)
+```
+
+
+# Top N heatmap section
+
+## Build the genus-level relative abundance table
+
+```{r}
+# Agglomerate at genus level
+ps_genus <- tax_glom(ps_rarefied, taxrank = "Genus", NArm = TRUE)
+
+# Filter out Incertae_sedis and other placeholder labels at the genus level
+genus_labels <- as.character(tax_table(ps_genus)[, "Genus"])
+real_genera_mask <- !grepl("Incertae_sedis|Incertae sedis|unidentified|gen_Incertae",
+                           genus_labels, ignore.case = TRUE)
+
+ps_genus_named <- prune_taxa(real_genera_mask, ps_genus)
+
+cat("Genus-level taxa before filtering:", ntaxa(ps_genus), "\n")
+cat("Genus-level taxa after filtering placeholders:", ntaxa(ps_genus_named), "\n")
+
+# Convert to relative abundance per sample
+ps_genus_rel <- transform_sample_counts(ps_genus_named, function(x) x / sum(x))
+```
+
+
+## Identify top 15 genera by mean relative abundance
+
+```{r}
+# Define prevalence: number of samples each genus appears in (count > 0)
+prevalence <- apply(otu_table(ps_genus_rel), 1, function(x) sum(x > 0))
+prevalence_pct <- (prevalence / nsamples(ps_genus_rel)) * 100
+
+# Filter for genera present in >= 10% of samples
+prevalent_taxa <- names(prevalence_pct[prevalence_pct >= 10])
+
+cat("Genera before prevalence filter:", ntaxa(ps_genus_rel), "\n")
+cat("Genera present in >= 10% of samples:", length(prevalent_taxa), "\n")
+
+# Among prevalent genera, pick top 15 by mean relative abundance
+genus_means <- taxa_sums(ps_genus_rel)[prevalent_taxa] / nsamples(ps_genus_rel)
+top15_taxa  <- names(sort(genus_means, decreasing = TRUE))[1:15]
+
+top15_genera <- tax_table(ps_genus_rel)[top15_taxa, "Genus"] %>%
+  as.character() %>%
+  gsub("g__", "", .)
+
+cat("\nTop 15 prevalent named fungal genera:\n")
+print(top15_genera)
+```
+
+
+## Build a site × season heatmap dataframe
+
+```{r}
+ps_top15 <- prune_taxa(top15_taxa, ps_genus_rel)
+
+heatmap_df <- psmelt(ps_top15) %>%
+  mutate(Genus = gsub("g__", "", Genus),
+         site_season = paste(site, season, sep = " - ")) %>%
+  group_by(Genus, site, season, site_season) %>%
+  summarise(mean_abund = mean(Abundance), .groups = "drop")
+
+genus_order <- heatmap_df %>%
+  group_by(Genus) %>%
+  summarise(grand_mean = mean(mean_abund)) %>%
+  arrange(desc(grand_mean)) %>%
+  pull(Genus)
+
+heatmap_df$Genus <- factor(heatmap_df$Genus, levels = rev(genus_order))
+
+season_order <- c("Spring", "Summer", "Fall")
+site_order   <- c("LEWI", "MART", "POSE", "WALK")
+ss_levels    <- as.vector(outer(site_order, season_order, paste, sep = " - "))
+heatmap_df$site_season <- factor(heatmap_df$site_season, levels = ss_levels)
+```
+
+
+## Plot the heatmap
+
+```{r}
+p_heatmap <- ggplot(heatmap_df,
+                    aes(x = site_season, y = Genus, fill = mean_abund * 100)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.1f", mean_abund * 100),
+                color = mean_abund * 100 > 6),
+            size = 2.8,
+            show.legend = FALSE) +
+  scale_fill_viridis_c(option = "magma", direction = -1,
+                       trans = "sqrt",
+                       name = "Mean relative\nabundance (%)") +
+  scale_color_manual(values = c("TRUE" = "white", "FALSE" = "black")) +
+  scale_x_discrete(position = "top") +
+  labs(title    = "Top 15 fungal genera by site and season",
+       subtitle = "Mean relative abundance (%) per site × season; UNITE Incertae_sedis placeholders excluded",
+       caption  = "Genera ordered by overall mean relative abundance. Square-root color scale used to reveal patterns across the abundance range.",
+       x        = NULL,
+       y        = NULL) +
+  theme_bw(base_size = 11) +
+  theme(plot.title       = element_text(face = "bold"),
+        plot.subtitle    = element_text(color = "grey40", size = 9),
+        plot.caption     = element_text(color = "grey40", size = 8, hjust = 0),
+        axis.text.x.top  = element_text(angle = 45, hjust = 0, vjust = 0, size = 9),
+        axis.text.y      = element_text(face = "italic", size = 9),
+        panel.grid       = element_blank(),
+        legend.position  = "right")
+p_heatmap
+
+ggsave("~/Documents/NEON/March_final/ITS_tax/plots/p_heatmap_top15_named.png",
+       p_heatmap, width = 11, height = 8, dpi = 300)
+```
+
+- A heatmap of the top 15 fungal genera by mean relative abundance was constructed at the genus × site × season level (n = 12 site-season combinations, 15 genera). UNITE Incertae sedis placeholder labels and genera present in fewer than 10% of samples were excluded prior to selection, ensuring the heatmap represents broadly distributed and confidently classified fungal taxa.
+- Ramularia was the single most abundant genus, with peak relative abundance at WALK Summer (~70%), and additional high-abundance peaks at WALK Fall and POSE Fall.
+- Sampaiozyma was broadly distributed across all 12 site-season combinations, indicating it is a consistent member of NEON epilithon fungal communities.
+- Several genera showed strong site- or site-season-specific signatures: Meira and Clydaea were enriched at LEWI Spring; Ganoderma, Rhizophydium, and Emericellopsis co-peaked at LEWI Summer; Penicillium peaked at LEWI Fall; Cercospora peaked at MART Fall; Trichoderma and Lecanicillium peaked at MART Spring; Talaromyces peaked at WALK Fall.
+- The combination of broadly distributed taxa (Sampaiozyma, Ramularia) and site-season-specific enrichments mirrors the strong site and seasonal effects detected by PERMANOVA (site R² = 0.151, season R² = 0.059; both p = 0.001).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

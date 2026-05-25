@@ -1,0 +1,1003 @@
+---
+title: "Shotgun metagenomic Taxonomic analysis"
+output: html_document
+author: "Rebekah Lanning"
+date: "2026-05-02"
+---
+
+- NEON Epilithon Shotgun Metagenomics
+- Sites: LEWI, MART, POSE, WALK | Years: 2022-2023
+- MMUPHin batch correction applied to all community matrices
+- to remove instrument effect (NovaSeq 6000 vs NovaSeq X 10B)
+- Phyla signature heatmaps derived from PC1/PC2 loadings
+- alpha diversity
+- Kraken2 classification rates
+
+
+## 1. Load required paths
+```{r}
+library(tidyverse)
+library(vegan)
+library(ggplot2)
+library(RColorBrewer)
+library(patchwork)
+library(MMUPHin)
+library(ggpubr)
+library(rstatix)
+```
+
+## 2. Set the file paths
+
+```{r}
+SPECIES_FILE  <- "~/Downloads/combined_species.txt"
+PHYLUM_FILE   <- "~/Downloads/combined_phylum.txt"
+METADATA_FILE <- "~/Documents/NEON/March_final/metadata/shotgun/filtered_metadata_metagenomes.tsv"
+MANIFEST_FILE <- "~/Documents/NEON/March_final/metadata/shotgun/shotgun_manifest.tsv"
+OUTPUT_DIR    <- "~/Documents/NEON/March_final/Kraken2_Bracken_May4/"
+```
+
+
+## 3. Build the metadata 
+
+Read in the manifest file and create a new column called sample_id by taking the filename and stripping the _R1.fastq.gz suffix from the end.
+```{r}
+manifest <- read_tsv(MANIFEST_FILE) %>%
+  mutate(sample_id = gsub("_R1\\.fastq\\.gz$", "", R1))
+```
+
+
+Read in the metadata file
+```{r}
+metadata <- read_tsv(METADATA_FILE)
+``` 
+
+
+```{r}
+meta <- manifest %>%
+  left_join(metadata, by = "dnaSampleID") %>%
+  filter(year.x != 2021) %>%
+  select(sample_id,
+         site             = site.x,
+         year             = year.x,
+         instrument_model,
+         sampleTotalReadNumber) %>%
+  mutate(
+    site       = factor(site, levels = c("LEWI", "POSE", "WALK", "MART")),
+    year       = factor(year),
+    instrument = factor(instrument_model)
+  )
+```
+ 
+ 
+Create the seasons column
+```{r}
+meta <- manifest %>%
+  left_join(metadata, by = "dnaSampleID") %>%
+  filter(year.x != 2021) %>%
+  select(sample_id,
+         site             = site.x,
+         year             = year.x,
+         month            = month.x,
+         instrument_model,
+         sampleTotalReadNumber) %>%
+  mutate(
+    site       = factor(site, levels = c("LEWI", "POSE", "WALK", "MART")),
+    year       = factor(year),
+    instrument = factor(instrument_model),
+    season     = case_when(
+      month %in% c(3, 4, 5)   ~ "Spring",
+      month %in% c(6, 7, 8)   ~ "Summer",
+      month %in% c(9, 10, 11) ~ "Fall",
+      TRUE                     ~ NA_character_
+    ),
+    season = factor(season, levels = c("Spring", "Summer", "Fall"))
+  )
+
+meta <- meta %>% mutate(site = factor(site, levels = c("LEWI", "MART", "POSE", "WALK")))
+
+meta <- meta %>% mutate(year = factor(year))
+```
+ 
+Save the metadata file 
+ 
+```{r} 
+write_csv(meta, "~/Documents/NEON/March_final/metadata/shotgun/meta_with_seasons.csv")
+```
+ 
+## Load and filter the phylum tables 
+
+Read in the combined phylum file 
+```{r}
+phylum_raw <- read_tsv(PHYLUM_FILE)
+```
+
+
+- Look at all the column names in phylum_raw, find only the ones that end in _num ($ means "end of string)
+- Return those column names as a character vector and save them in num_cols_p
+This selects the read count columns and ignores the fraction columns (white end in _frac)
+```{r}
+num_cols_p <- grep("_num$", colnames(phylum_raw), value = TRUE)
+```
+
+- Take phylum_raw and only keep the columns name (phylum names), the taxonomy_id, and all the count columns identified in num_cols_p
+- This drops all of the _frac columns, keeping only the raw read counts
+```{r}
+phylum_counts <- phylum_raw %>%
+  select(name, taxonomy_id, all_of(num_cols_p))
+```
+
+
+```{r}
+colnames(phylum_counts) <- gsub("_bracken_P\\.txt_num$", "", colnames(phylum_counts))
+```
+
+
+Save the names of the eukaryote phyla and the fungal phyla into vectors that will be used to filter them out of the data
+```{r}
+eukaryote_phyla <- c("Chordata", "Ascomycota", "Basidiomycota",
+                     "Mucoromycota", "Bacillariophyta", "Oomycota",
+                     "Apicomplexa", "Euglenozoa", "Ciliophora", "Streptophyta")
+fungi_phyla     <- c("Ascomycota", "Basidiomycota", "Mucoromycota")
+```
+
+### Full community: Chordata removed only
+
+- Convert the dataframe into a numeric matrix
+- This is required because vegan, MMUPHin, and other analysis functions expect a matrix object, not a dataframe
+End result: a matrix with phyla as rows and the 40 samples as columns, containing read counts, with Chordata removed.
+```{r}
+phylum_mat_full <- phylum_counts %>%
+  filter(!name %in% "Chordata") %>%
+  column_to_rownames("name") %>%
+  select(-taxonomy_id) %>%
+  select(any_of(meta$sample_id)) %>%
+  as.matrix()
+```
+
+
+
+### Bacteria + Archaea: all eukaryotes removed
+- Do the same thing as above except for keeping everything that is not a eukaryote phylum
+```{r}
+phylum_mat_bact <- phylum_counts %>%
+  filter(!name %in% eukaryote_phyla) %>%
+  column_to_rownames("name") %>%
+  select(-taxonomy_id) %>%
+  select(any_of(meta$sample_id)) %>%
+  as.matrix()
+```
+ 
+ 
+### Fungi only
+- Do the same thing as above except only keep the fungal phyla rows
+```{r}
+phylum_mat_fungi <- phylum_counts %>%
+  filter(name %in% fungi_phyla) %>%
+  column_to_rownames("name") %>%
+  select(-taxonomy_id) %>%
+  select(any_of(meta$sample_id)) %>%
+  as.matrix()
+```
+ 
+ 
+### Align metadata row order to matrix column order
+
+```{r}
+meta_df <- meta %>% column_to_rownames("sample_id") %>% as.data.frame()
+```
+
+
+## 4. RELATIVE ABUNDANCE HELPER 
+
+This creates a reusable mini-function called to_relab that converts raw read counts to relative abundance. Breaking down sweep:
+  + mat - the input count matrix
+  + 2 - apply the operation to columns (1 would mean rows)
+  + colSums(mat) - calculate the total reads in each sample (column sum)
+  + "/" - divide each value by that column total
+So for each sample, every phylum's read count gets divided by the total reads in that sample, giving you proportions that sum to 1. For example if Pseudomonadota has 5,000 reads and the sample has 20,000 total reads, it becomes 0.25 (25% relative abundance).
+```{r}
+to_relab <- function(mat) sweep(mat, 2, colSums(mat), "/")
+```
+
+
+## 5. MMUPHLN BATCH CORRECTION FUNCTION 
+Corrects for instrument (NovaSeq 6000 vs NovaSeq X 10B) while preserving site signal
+- This creates a reusable function called batch_correct that takes three inputs - a count matrix, a metadata dataframe, and a label for printing messages.
+  + relab <- to_relab(mat) - first converts the count matrix to relative abundance using the helper function just defined
+  + m <- meta_df[colnames(relab), ] - reorders the metadata rows to exactly match the column order of the matrix - this alignment is     + critical because MMUPHin needs samples to line up perfectly between the matrix and the metadata
+  + cat(...) - prints a message to the console so you know which matrix is being corrected
+  + adjust_batch(...) - calls the MMUPHin function with four arguments:
+  + feature_abd = relab - the relative abundance matrix to correct
+  + batch = "instrument_model" - the column in the metadata that defines the batch (NovaSeq 6000 vs NovaSeq X 10B)
+  + covariates = "site" - tells MMUPHin to preserve this biological signal while removing the batch effect
+  + control = list(verbose = FALSE) - suppresses MMUPHin's internal progress messages
+
+  + fit$feature_abd_adj - extracts just the corrected abundance matrix from MMUPHin's output object
+
+  + The last three lines then call this function three times, once for each community type, saving the corrected matrices as     relab_full_corrected, relab_bact_corrected, and relab_fungi_corrected.
+
+```{r}
+batch_correct <- function(mat, meta_df, label) {
+  relab <- to_relab(mat)
+  # align meta to matrix columns
+  m <- meta_df[colnames(relab), ]
+  cat("\nRunning MMUPHin batch correction for:", label, "\n")
+  fit <- adjust_batch(
+    feature_abd = relab,
+    batch       = "instrument_model",
+    covariates  = "site",
+    data        = m,
+    control     = list(verbose = FALSE)
+  )
+  fit$feature_abd_adj
+}
+ 
+relab_full_corrected  <- batch_correct(phylum_mat_full,  meta_df, "Full Community")
+relab_bact_corrected  <- batch_correct(phylum_mat_bact,  meta_df, "Bacteria + Archaea")
+relab_fungi_corrected <- batch_correct(phylum_mat_fungi, meta_df, "Fungi")
+ 
+cat("\nBatch correction complete for all three matrices.\n")
+```
+
+## 6. PCoA + PERMANOVA FUNCTION 
+
+
+```{r}
+run_pcoa <- function(relab_corrected, meta_df, label) {
+  m <- meta_df[colnames(relab_corrected), ]
+ 
+  bc   <- vegdist(t(relab_corrected), method = "bray")
+  pcoa <- cmdscale(bc, k = 4, eig = TRUE)
+  pct  <- round(pcoa$eig / sum(pcoa$eig[pcoa$eig > 0]) * 100, 1)
+ 
+  pcoa_df <- as.data.frame(pcoa$points) %>%
+    rownames_to_column("sample_id") %>%
+    rename(PC1 = V1, PC2 = V2, PC3 = V3, PC4 = V4) %>%
+    left_join(meta %>% select(sample_id, site, year), by = "sample_id")
+ 
+  cat("\n===", label, "(batch corrected) ===\n")
+  cat("PERMANOVA ~ site:\n")
+  print(adonis2(t(relab_corrected) ~ site, data = m,
+                method = "bray", permutations = 999))
+ 
+  list(pcoa_df = pcoa_df, pct = pct, bc = bc)
+}
+ 
+pcoa_full  <- run_pcoa(relab_full_corrected,  meta_df, "Full Community")
+pcoa_bact  <- run_pcoa(relab_bact_corrected,  meta_df, "Bacteria + Archaea")
+pcoa_fungi <- run_pcoa(relab_fungi_corrected, meta_df, "Fungi")
+```
+
+
+## 7. PCoA PLOT FUNCTION
+
+```{r}
+site_colors <- c("LEWI" = "#E41A1C", "MART" = "#377EB8",
+                 "POSE" = "#4DAF4A", "WALK" = "#984EA3")
+
+# Helper to format the marginal site stat for a PCoA subtitle
+make_marg_subtitle <- function(perm_obj) {
+  sprintf("PERMANOVA (marginal site): R\u00b2 = %.3f, F = %.3f, p = %.3f",
+          perm_obj$R2[1], perm_obj$F[1], perm_obj$`Pr(>F)`[1])
+}
+
+make_pcoa <- function(pcoa_obj, title_text, marg_subtitle) {
+  pct <- pcoa_obj$pct
+
+  p12 <- ggplot(pcoa_obj$pcoa_df,
+         aes(x = PC1, y = PC2, color = site, shape = year)) +
+    geom_point(size = 3, alpha = 0.8) +
+    stat_ellipse(aes(group = site), level = 0.95, linetype = "dashed") +
+    scale_color_manual(values = site_colors, name = "Site") +
+    scale_shape_manual(values = c("2022" = 16, "2023" = 17), name = "Year") +
+    labs(title    = "PC1 vs PC2",
+         subtitle = marg_subtitle,
+         x = paste0("PC1 (", pct[1], "%)"),
+         y = paste0("PC2 (", pct[2], "%)")) +
+    theme_bw(base_size = 12) +
+    theme(plot.title    = element_text(face = "bold"),
+          plot.subtitle = element_text(color = "grey40", size = 9))
+
+  p13 <- ggplot(pcoa_obj$pcoa_df,
+         aes(x = PC1, y = PC3, color = site, shape = year)) +
+    geom_point(size = 3, alpha = 0.8) +
+    stat_ellipse(aes(group = site), level = 0.95, linetype = "dashed") +
+    scale_color_manual(values = site_colors, name = "Site") +
+    scale_shape_manual(values = c("2022" = 16, "2023" = 17), name = "Year") +
+    labs(title    = "PC1 vs PC3",
+         subtitle = marg_subtitle,
+         x = paste0("PC1 (", pct[1], "%)"),
+         y = paste0("PC3 (", pct[3], "%)")) +
+    theme_bw(base_size = 12) +
+    theme(plot.title    = element_text(face = "bold"),
+          plot.subtitle = element_text(color = "grey40", size = 9))
+
+  (p12 | p13) +
+    plot_annotation(
+      title    = title_text,
+      subtitle = "MMUPHin batch corrected | NEON epilithon 2022-2023",
+      caption  = paste0("PC1+PC2 = ", pct[1]+pct[2], "%"),
+      theme = theme(
+        plot.title    = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "grey40", size = 9),
+        plot.caption  = element_text(color = "grey40", size = 8, hjust = 0)
+      )
+    )
+}
+```
+
+## 8. EXTRACT PC LOADINGS (PHYLA DRIVING AXES) 
+- Method: Spearman correlation between each phylum's relative abundance and PC1/PC2 scores across samples. High |r| = strong loading on that axis.
+- This identifies which phyla best explain the PCoA axes.
+- This function answers the question: which phyla are actually driving the separation seen in the PCoA?
+ 
+```{r}
+get_loadings <- function(relab_corrected, pcoa_obj, n_top = 10,
+                         min_prevalence = 0.10, min_mean_abund = 0.001,
+                         label = "") {
+  scores <- pcoa_obj$pcoa_df %>%
+    select(sample_id, PC1, PC2) %>%
+    column_to_rownames("sample_id")
+
+  relab_t <- t(relab_corrected)
+  # align
+  shared  <- intersect(rownames(scores), rownames(relab_t))
+  scores  <- scores[shared, ]
+  relab_t <- relab_t[shared, ]
+
+  # ---- Filter rare phyla before correlation ----
+  # Prevalence: fraction of samples where the phylum is detected (>0)
+  prevalence <- apply(relab_t, 2, function(x) mean(x > 0))
+  # Mean relative abundance across all samples
+  mean_abund <- apply(relab_t, 2, mean)
+
+  # Keep phyla present in >=10% of samples AND with mean relab >=0.1%
+  keep_phyla <- prevalence >= min_prevalence & mean_abund >= min_mean_abund
+  cat(sprintf("[%s] Phyla before filter: %d, after filter: %d\n",
+              label, ncol(relab_t), sum(keep_phyla)))
+
+  relab_t <- relab_t[, keep_phyla, drop = FALSE]
+
+  # Spearman correlation of each phylum with PC1 and PC2
+  cor_pc1 <- apply(relab_t, 2, function(x)
+    cor(x, scores$PC1, method = "spearman", use = "complete.obs"))
+  cor_pc2 <- apply(relab_t, 2, function(x)
+    cor(x, scores$PC2, method = "spearman", use = "complete.obs"))
+
+  loadings <- tibble(
+    phylum  = names(cor_pc1),
+    cor_PC1 = cor_pc1,
+    cor_PC2 = cor_pc2,
+    abs_PC1 = abs(cor_pc1),
+    abs_PC2 = abs(cor_pc2)
+  ) %>%
+    arrange(desc(abs_PC1))
+
+  top_pc1 <- loadings %>% arrange(desc(abs_PC1)) %>% slice_head(n = n_top) %>% pull(phylum)
+  top_pc2 <- loadings %>% arrange(desc(abs_PC2)) %>% slice_head(n = n_top) %>% pull(phylum)
+  top_phyla <- unique(c(top_pc1, top_pc2))
+
+  list(loadings = loadings, top_phyla = top_phyla)
+}
+ 
+load_full  <- get_loadings(relab_full_corrected,  pcoa_full,  label = "Full Community")
+load_bact  <- get_loadings(relab_bact_corrected,  pcoa_bact,  label = "Bacteria + Archaea")
+load_fungi <- get_loadings(relab_fungi_corrected, pcoa_fungi, label = "Fungi")
+```
+
+## 9. PHYLA SIGNATURE HEATMAP FUNCTION 
+
+- Rows = top phyla (PC1 + PC2 drivers)
+- Columns = samples grouped by site
+- Fill = mean relative abundance per site
+- This lets you say "MART is characterised by X phylum"
+
+```{r} 
+make_signature_heatmap <- function(relab_corrected, top_phyla,
+                                   loadings_obj, title_text) {
+ 
+  # Mean relative abundance per site for top phyla
+  relab_df <- as.data.frame(t(relab_corrected)) %>%
+    rownames_to_column("sample_id") %>%
+    left_join(meta %>% select(sample_id, site), by = "sample_id") %>%
+    select(site, all_of(top_phyla)) %>%
+    group_by(site) %>%
+    summarise(across(everything(), mean), .groups = "drop") %>%
+    pivot_longer(-site, names_to = "phylum", values_to = "mean_relab")
+ 
+  # Add PC1 and PC2 correlation for ordering and annotation
+  load_df <- loadings_obj$loadings %>%
+    filter(phylum %in% top_phyla) %>%
+    mutate(
+      pc1_dir = ifelse(cor_PC1 > 0, "+PC1", "-PC1"),
+      pc2_dir = ifelse(cor_PC2 > 0, "+PC2", "-PC2"),
+      axis    = case_when(
+        abs(cor_PC1) >= abs(cor_PC2) ~ paste0("PC1 (r=", round(cor_PC1, 2), ")"),
+        TRUE                          ~ paste0("PC2 (r=", round(cor_PC2, 2), ")")
+      )
+    )
+ 
+  # Order phyla by PC1 correlation (positive to negative)
+  phylum_order <- loadings_obj$loadings %>%
+    filter(phylum %in% top_phyla) %>%
+    arrange(cor_PC1) %>%
+    pull(phylum)
+ 
+  plot_df <- relab_df %>%
+    left_join(load_df %>% select(phylum, axis, cor_PC1, cor_PC2),
+              by = "phylum") %>%
+    mutate(
+      phylum = factor(phylum, levels = phylum_order),
+      site   = factor(site, levels = c("LEWI", "POSE", "WALK", "MART"))
+    )
+ 
+  ggplot(plot_df, aes(x = site, y = phylum, fill = mean_relab * 100)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = round(mean_relab * 100, 1),
+                  color = mean_relab * 100 > 12),
+              size = 3, show.legend = FALSE) +
+    scale_color_manual(values = c("TRUE" = "white", "FALSE" = "black")) +
+    scale_fill_viridis_c(
+      option    = "inferno",
+      direction = -1,
+      trans     = "sqrt",
+      breaks    = c(0, 1, 5, 15, 30, 60),
+      name      = "Mean relative\nabundance (%)"
+    ) +
+    labs(
+      title    = title_text,
+      subtitle = "Top phyla driving PC1 and PC2 | batch corrected | values = mean % per site",
+      x        = "Site",
+      y        = "Phylum"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x  = element_text(size = 12, face = "bold"),
+      axis.text.y  = element_text(size = 10),
+      strip.text   = element_text(face = "bold"),
+      legend.position = "right"
+    )
+}
+ 
+p_heatmap_full  <- make_signature_heatmap(
+  relab_full_corrected,  load_full$top_phyla,  load_full,
+  "Phyla Signatures - Full Community")
+ 
+p_heatmap_bact  <- make_signature_heatmap(
+  relab_bact_corrected,  load_bact$top_phyla,  load_bact,
+  "Phyla Signatures - Bacteria + Archaea")
+ 
+p_heatmap_fungi <- make_signature_heatmap(
+  relab_fungi_corrected, load_fungi$top_phyla, load_fungi,
+  "Phyla Signatures - Fungi")
+ 
+ggsave(paste0(OUTPUT_DIR, "heatmap_full_signatures.pdf"),
+       p_heatmap_full,  width = 8, height = 10)
+ggsave(paste0(OUTPUT_DIR, "heatmap_bact_signatures.pdf"),
+       p_heatmap_bact,  width = 8, height = 10)
+ggsave(paste0(OUTPUT_DIR, "heatmap_fungi_signatures.pdf"),
+       p_heatmap_fungi, width = 8, height = 5)
+
+```
+
+```{r}
+print(p_heatmap_full)
+```
+
+```{r}
+print(p_heatmap_bact)
+```
+
+```{r}
+print(p_heatmap_fungi)
+``` 
+
+## 10. SAVE LOADING TABLES
+```{r}
+write_csv(load_full$loadings,  paste0(OUTPUT_DIR, "loadings_full.csv"))
+write_csv(load_bact$loadings,  paste0(OUTPUT_DIR, "loadings_bact.csv"))
+write_csv(load_fungi$loadings, paste0(OUTPUT_DIR, "loadings_fungi.csv"))
+```
+ 
+
+## 12. Additional Beta Diversity Tests
+
+### PERMDISP by site
+
+H0: Dispersion of community composition does not differ between sites
+
+HA: At least one site has significantly different dispersion
+
+```{r}
+# Use full community batch-corrected matrix
+m_full <- meta_df[colnames(relab_full_corrected), ]
+bc_full <- pcoa_full$bc
+
+disp_site <- betadisper(bc_full, m_full$site)
+set.seed(123)
+perm_disp <- permutest(disp_site, permutations = 999)
+print(perm_disp)
+```
+- While the p-value is cloe to alpha (0.05), it is not at or above 0.05 and therefore, I reject the null hypothesis and claim that at least one site differs in dispersion.
+- WALK shows highest within-site variability, POSE is most internally consistent
+- The PERMANOVA site effect reflects both compositional differences AND differences in within-site variability
+- Note: colors order is LEWI=red, MART=blue, POSE=green, WALK=purple
+
+
+PERMADISP by site boxplot
+```{r}
+boxplot(disp_site,
+        col  = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3"),
+        main = "PERMDISP - taxonomic dispersion by site",
+        ylab = "Distance to centroid")
+```
+
+### PERMANOVA by year
+
+H0: Community composition does not differ between 2022 and 2023 overall
+
+HA: Community composition differs between years overall
+
+```{r}
+set.seed(123)
+perm_year <- adonis2(t(relab_full_corrected) ~ year, data = m_full,
+                     method = "bray", permutations = 999)
+print(perm_year)
+```
+- Fail to reject H0 - taxonomic community composition does not differ between years overall (R²=0.017, F=0.675, p=0.557)
+- Year explains only 1.7% of variance
+
+
+### Full marginal model
+
+H0: Neither site nor year explains community composition after controlling for the other
+
+HA: At least one term is significant after controlling for the other
+
+```{r}
+# Build metadata subsets aligned to each batch-corrected matrix
+m_full  <- meta_df[colnames(relab_full_corrected),  ]
+m_bact  <- meta_df[colnames(relab_bact_corrected),  ]
+m_fungi <- meta_df[colnames(relab_fungi_corrected), ]
+
+# Full community marginal PERMANOVA
+set.seed(123)
+perm_full_marg <- adonis2(t(relab_full_corrected) ~ site + year,
+                          data = m_full,
+                          method = "bray",
+                          permutations = 999,
+                          by = "margin")
+cat("\n=== Full community marginal PERMANOVA ===\n")
+print(perm_full_marg)
+
+# Bacteria + Archaea marginal PERMANOVA
+set.seed(123)
+perm_bact_marg <- adonis2(t(relab_bact_corrected) ~ site + year,
+                          data = m_bact,
+                          method = "bray",
+                          permutations = 999,
+                          by = "margin")
+cat("\n=== Bacteria + Archaea marginal PERMANOVA ===\n")
+print(perm_bact_marg)
+
+# Fungi marginal PERMANOVA
+set.seed(123)
+perm_fungi_marg <- adonis2(t(relab_fungi_corrected) ~ site + year,
+                           data = m_fungi,
+                           method = "bray",
+                           permutations = 999,
+                           by = "margin")
+cat("\n=== Fungi marginal PERMANOVA ===\n")
+print(perm_fungi_marg)
+```
+
+
+```{r}
+p_pcoa_full  <- make_pcoa(pcoa_full,
+                          "Full Community PCoA (Batch Corrected)",
+                          make_marg_subtitle(perm_full_marg))
+
+p_pcoa_bact  <- make_pcoa(pcoa_bact,
+                          "Bacteria + Archaea PCoA (Batch Corrected)",
+                          make_marg_subtitle(perm_bact_marg))
+
+p_pcoa_fungi <- make_pcoa(pcoa_fungi,
+                          "Fungi PCoA (Batch Corrected)",
+                          make_marg_subtitle(perm_fungi_marg))
+
+p_pcoa_full
+p_pcoa_bact
+p_pcoa_fungi
+
+ggsave(paste0(OUTPUT_DIR, "pcoa_full_corrected.pdf"),  p_pcoa_full,  width = 14, height = 6)
+ggsave(paste0(OUTPUT_DIR, "pcoa_bact_corrected.pdf"),  p_pcoa_bact,  width = 14, height = 6)
+ggsave(paste0(OUTPUT_DIR, "pcoa_fungi_corrected.pdf"), p_pcoa_fungi, width = 14, height = 6)
+```
+
+# 11. COMBINED PCoA PANEL 
+
+  
+```{r}
+p_combined <- wrap_elements(p_pcoa_full)  /
+              wrap_elements(p_pcoa_bact)  /
+              wrap_elements(p_pcoa_fungi) +
+  plot_annotation(title = "Batch-Corrected PCoA - All Community Types",
+                  theme = theme(plot.title = element_text(size = 14, face = "bold")))
+
+ggsave(paste0(OUTPUT_DIR, "pcoa_all_corrected_panel.pdf"),
+       p_combined, width = 14, height = 18)
+
+p_combined
+```
+
+
+## 13. Per-site year PCoA and PERMANOVA
+```{r}
+sites <- c("LEWI", "MART", "POSE", "WALK")
+site_colors_year <- list(
+  LEWI = c("2022" = "#FFAAAA", "2023" = "#990000"),
+  MART = c("2022" = "#9EC4E0", "2023" = "#1A3D5C"),
+  POSE = c("2022" = "#B8E4B8", "2023" = "#1F7A1F"),
+  WALK = c("2022" = "#D4A8E0", "2023" = "#5B1A7A")
+)
+
+per_site_plots <- list()
+
+for (s in sites) {
+  # Subset samples
+  s_samples <- rownames(m_full)[m_full$site == s]
+  relab_sub <- relab_full_corrected[, s_samples]
+  meta_sub  <- m_full[s_samples, ]
+  
+  # Bray-Curtis + PCoA
+  bc_sub   <- vegdist(t(relab_sub), method = "bray")
+  pcoa_sub <- cmdscale(bc_sub, eig = TRUE, k = 2)
+  var_sub  <- round(pcoa_sub$eig / sum(pcoa_sub$eig[pcoa_sub$eig > 0]) * 100, 1)
+  
+  # PERMANOVA ~ year
+  set.seed(123)
+  perm_sub <- adonis2(bc_sub ~ year, data = meta_sub, permutations = 999)
+  cat("\n===", s, "PERMANOVA ~ year ===\n")
+  print(perm_sub)
+  
+  # Build plot dataframe
+  pcoa_df_sub <- data.frame(
+    PC1       = pcoa_sub$points[, 1],
+    PC2       = pcoa_sub$points[, 2],
+    sample_id = rownames(pcoa_sub$points)
+  ) %>% left_join(meta, by = "sample_id")
+  
+  # Hulls for LEWI, ellipses for others
+  if (s == "LEWI") {
+    hulls <- pcoa_df_sub %>% group_by(year) %>% slice(chull(PC1, PC2))
+    p <- ggplot(pcoa_df_sub, aes(x = PC1, y = PC2)) +
+      geom_polygon(data = hulls, aes(fill = year, group = year), alpha = 0.15) +
+      geom_point(aes(color = year), size = 4) +
+      scale_color_manual(values = site_colors_year[[s]], name = "Year") +
+      scale_fill_manual(values = site_colors_year[[s]], name = "Year") +
+      labs(title    = paste0(s, " - Taxonomic PCoA by year"),
+           subtitle = paste0("PERMANOVA: R²=", round(perm_sub$R2[1], 3),
+                             ", F=", round(perm_sub$F[1], 3),
+                             ", p=", perm_sub$`Pr(>F)`[1]),
+           caption  = "Convex hulls shown (n=3 per group)",
+           x = paste0("PC1 (", var_sub[1], "%)"),
+           y = paste0("PC2 (", var_sub[2], "%)")) +
+      theme_bw(base_size = 12) +
+      theme(plot.title    = element_text(face = "bold"),
+            plot.subtitle = element_text(color = "grey40", size = 9),
+            plot.caption  = element_text(color = "grey40", size = 8))
+  } else {
+    p <- ggplot(pcoa_df_sub, aes(x = PC1, y = PC2)) +
+      geom_point(aes(color = year), size = 4) +
+      stat_ellipse(aes(group = year, color = year),
+                   level = 0.95, linetype = "dashed", linewidth = 0.8) +
+      scale_color_manual(values = site_colors_year[[s]], name = "Year") +
+      labs(title    = paste0(s, " - Taxonomic PCoA by year"),
+           subtitle = paste0("PERMANOVA: R²=", round(perm_sub$R2[1], 3),
+                             ", F=", round(perm_sub$F[1], 3),
+                             ", p=", perm_sub$`Pr(>F)`[1]),
+           x = paste0("PC1 (", var_sub[1], "%)"),
+           y = paste0("PC2 (", var_sub[2], "%)")) +
+      theme_bw(base_size = 12) +
+      theme(plot.title    = element_text(face = "bold"),
+            plot.subtitle = element_text(color = "grey40", size = 9))
+  }
+  
+  per_site_plots[[s]] <- p
+  print(p)
+}
+```
+Key finding: No site shows significant interannual taxonomic turnover.
+This contrasts with HUMAnN3 functional analysis where POSE showed 
+significant year effect (p=0.009), suggesting functional shifts at 
+POSE occurred without detectable taxonomic change - consistent with 
+functional redundancy in microbial communities.
+
+
+## 14. Combined 4-panel per-site year PCoA
+```{r}
+p_combined_sites <- (per_site_plots[["LEWI"]] | per_site_plots[["MART"]]) /
+                    (per_site_plots[["POSE"]] | per_site_plots[["WALK"]]) +
+  plot_annotation(
+    title    = "Taxonomic Community Composition by Year - Per Site",
+    subtitle = "Bray-Curtis PCoA | Kraken2/Bracken phylum-level | MMUPHin batch-corrected",
+    caption  = "LEWI: convex hulls shown (n=3 per group) | Ellipses = 95% confidence",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(color = "grey40", size = 9),
+      plot.caption  = element_text(color = "grey40", size = 8, hjust = 0)
+    )
+  )
+
+p_combined_sites
+ggsave(paste0(OUTPUT_DIR, "pcoa_per_site_year_panel.pdf"),
+       p_combined_sites, width = 14, height = 12, dpi = 300)
+```
+
+# Alpha Diversity
+
+## 1. Set the filepaths
+```{r}
+KRAKEN2_DIR <- "~/Downloads/kraken2_reports/"
+OUTPUT_DIR  <- "~/Documents/NEON/March_final/Kraken2_Bracken_May4/"
+```
+ 
+## 2. Species matrix 
+- Load species-level Bracken combined table
+- 16,397 species x 40 samples
+SPECIES_FILE <- "~/Downloads/combined_species.txt"
+
+```{r}
+species_raw <- read_tsv(SPECIES_FILE)
+num_cols    <- grep("_num$", colnames(species_raw), value = TRUE)
+species_counts <- species_raw %>%
+  select(name, taxonomy_id, all_of(num_cols))
+colnames(species_counts) <- gsub("_bracken_S\\.txt_num$", "",
+                                  colnames(species_counts))
+
+# Build species matrix: rows = species, cols = samples
+otu_mat <- species_counts %>%
+  column_to_rownames("name") %>%
+  select(-taxonomy_id) %>%
+  select(any_of(meta$sample_id)) %>%
+  as.matrix()
+
+# Align column order to metadata
+sample_df <- meta %>% column_to_rownames("sample_id") %>% as.data.frame()
+otu_mat   <- otu_mat[, rownames(sample_df), drop = FALSE]
+
+cat("Species matrix dimensions:", nrow(otu_mat), "species x", ncol(otu_mat), "samples\n")
+```
+
+
+## 3. Kraken2 classification rates
+- Parse classification rate from each .k2report file
+- First line of k2report = unclassified reads percentage
+```{r}
+kraken_files <- list.files(KRAKEN2_DIR, pattern = "\\.k2report$",
+                            full.names = TRUE)
+ 
+kraken_rates <- map_dfr(kraken_files, function(f) {
+  sample      <- gsub("\\.k2report$", "", basename(f))
+  lines       <- readLines(f)
+  unclass_pct <- as.numeric(strsplit(trimws(lines[1]), "\t")[[1]][1])
+  class_pct   <- 100 - unclass_pct
+  tibble(sample_id = sample, classification_rate = class_pct)
+}) %>%
+  inner_join(meta, by = "sample_id")
+ 
+cat("Samples with Kraken2 reports:", nrow(kraken_rates), "\n")
+cat("\nClassification rates by site:\n")
+print(kraken_rates %>%
+        group_by(site) %>%
+        summarise(mean   = round(mean(classification_rate), 2),
+                  median = round(median(classification_rate), 2),
+                  min    = round(min(classification_rate), 2),
+                  max    = round(max(classification_rate), 2)))
+ 
+# Classification rate plot
+# Dunn's test for classification rate
+kw_class <- kruskal.test(classification_rate ~ site, data = kraken_rates)
+dunn_class <- dunn_test(kraken_rates, classification_rate ~ site, 
+                        p.adjust.method = "BH")
+dunn_class_sig <- dunn_class %>% 
+  filter(p.adj < 0.05) %>%
+  mutate(label = paste0("p=", round(p.adj, 4)))
+
+p_classrate <- ggplot(kraken_rates,
+                      aes(x = site, y = classification_rate, fill = site)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = year), width = 0.15, size = 2.5) +
+  stat_pvalue_manual(dunn_class_sig,
+                     label = "label",
+                     y.position = seq(max(kraken_rates$classification_rate) + 1,
+                                      max(kraken_rates$classification_rate) + nrow(dunn_class_sig),
+                                      length.out = nrow(dunn_class_sig)),
+                     tip.length = 0.01,
+                     size = 3) +
+  scale_fill_manual(values = site_colors, name = "Site") +
+  scale_color_manual(values = c("2022" = "#333333", "2023" = "#888888"),
+                     name = "Year") +
+  labs(
+    title    = "Kraken2 Classification Rates by Site",
+    subtitle = paste0("Kruskal-Wallis p=", format(kw_class$p.value, scientific = TRUE, digits = 3),
+                      " | Brackets = Dunn's post-hoc, BH corrected"),
+    x = "Site",
+    y = "Classification rate (%)"
+  ) +
+  theme_bw(base_size = 13)
+```
+```{r}
+print(dunn_class, n = Inf)
+```
+
+Look at the Kraken2 classification rates plot
+```{r}
+print(p_classrate)
+ggsave(paste0(OUTPUT_DIR, "kraken2_classification_rates.pdf"),
+       p_classrate, width = 7, height = 6)
+``` 
+
+
+Kruskal-Wallis: does classification rate differ by site?
+```{r}
+cat("\n--- Kruskal-Wallis: classification rate by site ---\n")
+print(kruskal.test(classification_rate ~ site, data = kraken_rates))
+``` 
+- Classification rate does differ by site
+
+# 4. Alpha diversity (species level)
+- Shannon diversity calculated on Bracken species-level read counts
+- Species matrix has 16,397 taxa x 40 samples
+```{r}
+otu_t <- t(otu_mat)  # transpose: samples as rows, species as columns
+ 
+alpha_df <- tibble(
+  sample_id = rownames(otu_t),
+  shannon   = diversity(otu_t, index = "shannon"),
+  observed  = specnumber(otu_t)
+) %>%
+  left_join(meta, by = "sample_id")
+ 
+cat("\nAlpha diversity summary by site:\n")
+print(alpha_df %>%
+        group_by(site) %>%
+        summarise(mean_shannon  = round(mean(shannon), 3),
+                  sd_shannon    = round(sd(shannon), 3),
+                  mean_observed = round(mean(observed), 0)))
+```
+                  
+
+# 5. Alpha diversity plot
+
+```{r}
+# Dunn's pairwise comparisons
+dunn_site <- dunn_test(alpha_df, shannon ~ site, p.adjust.method = "BH")
+print(dunn_site)
+```
+
+```{r}
+kw_site <- kruskal.test(shannon ~ site, data = alpha_df)
+
+dunn_sig <- dunn_site %>% 
+  filter(p.adj < 0.05) %>%
+  mutate(label = paste0("p=", round(p.adj, 4)))
+
+p_shannon <- ggplot(alpha_df,
+                    aes(x = site, y = shannon, fill = site)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = year), width = 0.15, size = 2.5) +
+  stat_pvalue_manual(dunn_sig,
+                     label = "label",
+                     y.position = seq(max(alpha_df$shannon) + 0.3,
+                                      max(alpha_df$shannon) + 0.3 + 0.1 * (nrow(dunn_sig) - 1),
+                                      length.out = nrow(dunn_sig)),
+                     tip.length = 0.01,
+                     size = 3) +
+  scale_fill_manual(values = site_colors, name = "Site") +
+  scale_color_manual(values = c("2022" = "#333333", "2023" = "#888888"),
+                     name = "Year") +
+  labs(title    = "Alpha Diversity - Shannon Index by Site",
+       subtitle = paste0("Kruskal-Wallis p=", format(kw_site$p.value, scientific = TRUE, digits = 3),
+                  " | Brackets = Dunn's post-hoc, BH corrected"),
+       x = "Site", y = "Shannon diversity (H')") +
+  theme_bw(base_size = 13)
+
+print(p_shannon)
+ggsave(paste0(OUTPUT_DIR, "alpha_shannon.pdf"), p_shannon, width = 7, height = 6)
+```
+
+# 6. Statistical tests for Alpha Diversity
+
+Test 1: Kruskal-Wallis - does Shannon differ by site?
+```{r}
+cat("\n--- Kruskal-Wallis: Shannon by site ---\n")
+print(kruskal.test(shannon ~ site, data = alpha_df))
+```
+- Shannon diversity does differ by site
+
+Test 2: Linear model with instrument as covariate
+- Checks whether site remains significant after accounting
+- for instrument batch effect (NovaSeq 6000 vs NovaSeq X 10B)
+```{r}
+# Test 2: Linear model with site, year, and instrument
+cat("\n--- Linear model: Shannon ~ site + year + instrument ---\n")
+lm_shannon <- lm(shannon ~ site + year + instrument, data = alpha_df)
+print(summary(lm_shannon))
+
+cat("\n--- ANOVA on linear model ---\n")
+print(anova(lm_shannon))
+```
+
+
+Test 3: Site only model for comparison
+```{r}
+cat("\n--- Linear model: Shannon ~ site only ---\n")
+lm_site_only <- lm(shannon ~ site, data = alpha_df)
+print(anova(lm_site_only))
+```
+
+
+## 7. Per-site year alpha diversity - Shannon
+```{r}
+library(rstatix)
+
+sites <- c("LEWI", "MART", "POSE", "WALK")
+per_site_alpha_plots <- list()
+
+for (s in sites) {
+  df_site <- alpha_df %>% filter(site == s) %>%
+    mutate(year = factor(year))
+  
+  kw <- kruskal.test(shannon ~ year, data = df_site)
+  wx <- wilcox.test(shannon ~ year, data = df_site)
+  
+  p <- ggplot(df_site, aes(x = year, y = shannon, fill = site)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.15, size = 2.5, color = "black", alpha = 0.6) +
+    stat_compare_means(comparisons = list(c("2022", "2023")),
+                       method = "wilcox.test",
+                       label = "p.format",
+                       bracket.size = 0.5) +
+    scale_fill_manual(values = site_colors, guide = "none") +
+    labs(title    = paste0(s, " - Shannon diversity by year"),
+         subtitle = paste0("Kruskal-Wallis p=", round(kw$p.value, 3),
+                           " | Wilcoxon p=", round(wx$p.value, 3),
+                           " (bracket)"),
+         x = "Year", y = "Shannon diversity (H')") +
+    theme_bw(base_size = 12) +
+    theme(plot.title    = element_text(face = "bold"),
+          plot.subtitle = element_text(color = "grey40", size = 9))
+  
+  per_site_alpha_plots[[s]] <- p
+  print(p)
+}
+```
+
+
+## 8. Combined 4-panel per-site year alpha diversity
+```{r}
+p_combined_alpha <- (per_site_alpha_plots[["LEWI"]] | per_site_alpha_plots[["MART"]]) /
+                    (per_site_alpha_plots[["POSE"]] | per_site_alpha_plots[["WALK"]]) +
+  plot_annotation(
+    title    = "Shannon Diversity by Year - Per Site",
+    subtitle = "Species-level Bracken output | NEON epilithon 2022-2023",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(color = "grey40", size = 9)
+    )
+  )
+
+p_combined_alpha
+ggsave(paste0(OUTPUT_DIR, "alpha_per_site_year_panel.pdf"),
+       p_combined_alpha, width = 12, height = 10, dpi = 300)
+```
+ 
+ 
+# . Save outputs
+```{r}
+write_csv(kraken_rates, paste0(OUTPUT_DIR, "kraken2_rates.csv"))
+write_csv(alpha_df,     paste0(OUTPUT_DIR, "alpha_shannon.csv"))
+ 
+cat("\nAll done!\n")
+```

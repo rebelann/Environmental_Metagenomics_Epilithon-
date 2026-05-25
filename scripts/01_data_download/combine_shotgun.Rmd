@@ -1,0 +1,60 @@
+---
+title: "Combine shotgun metadata"
+author: "Rebekah Lanning"
+date: "2026-05-25"
+---
+
+## Purpose: Combine shotgun_manifest.tsv and fitlered_metadata_metagenomes.tsv
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Install required packages
+```{r}
+library(tidyverse)
+```
+
+
+##Filepaths
+```{r}
+metadata <- read_tsv("~/Documents/NEON/March_final/metadata/shotgun/filtered_metadata_metagenomes.tsv")
+manifest <- read_tsv("~/Documents/NEON/March_final/metadata/shotgun/shotgun_manifest.tsv")
+```
+
+
+## Join on dnaSampleID, trim down to 40 metagenomes, save the combined tsv
+```{r}
+combined <- metadata %>%
+  left_join(
+    manifest %>% select(dnaSampleID, R1, R2),
+    by = "dnaSampleID"
+  ) %>%
+  select(
+    dnaSampleID,
+    genomicsSampleID,
+    site,
+    year,
+    month,
+    collection_date,
+    R1,
+    R2,
+    habitatType,
+    aquMicrobeType,
+    substratumSizeClass,
+    sampleMaterial = sampleMaterial.x,
+    sampleTotalReadNumber,
+    sampleFilteredReadNumber,
+    sequencerRunID,
+    instrument_model,
+    qaqcStatus_dna = qaqcStatus.x,
+    qaqcStatus_seq = qaqcStatus.y
+  ) %>%
+  # Keep only the 40 thesis samples (July 2022 + July 2023)
+  filter(year %in% c(2022, 2023))
+
+write_tsv(combined, "shotgun_metadata.tsv")
+
+cat("Combined metadata written:", nrow(combined), "samples\n")
+```
