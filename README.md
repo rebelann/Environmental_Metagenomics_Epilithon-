@@ -184,7 +184,7 @@ single user-facing `shotgun_metadata.tsv`.
 
 ## Citation
 
-Lanning, R. E. (2026). Environmental Surveillance Analysis Using Metagenomics of Stream 
+Lanning, R. E., Krohannon, A. (2026). Environmental Surveillance Analysis Using Metagenomics of Stream 
 Epilithon Biofilm [Master's thesis, Indiana University Indianapolis].
 
 ## Contact
